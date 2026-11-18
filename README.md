@@ -66,3 +66,5 @@ cargo test --workspace
 # Instalar el paquete .deb en Linux Mint
 sudo dpkg -i mint-downloader_0.1.0_amd64.deb
 ```
+### Aviso
+# Hecho totaltemente con IA.
