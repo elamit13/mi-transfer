@@ -582,6 +582,7 @@
   }
 
   function scanVideos() {
+    if (document.hidden) return;
     const videos = document.querySelectorAll("video");
     videos.forEach((v) => {
       attachVideoListeners(v);

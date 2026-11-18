@@ -29,10 +29,81 @@ from core.extractors.video_extractor import VideoQualityChoice, is_video_or_stre
 
 
 URL_EXTRACT_RE = re.compile(r"(?:https?|ftp|magnet)://[^\s<>\"']+|magnet:\?[^\s<>\"']+", re.I)
+_ALLOWED_SCHEMES_RE = re.compile(r"^(?:https?|ftp|magnet):", re.I)
+_HREF_RE = re.compile(r'href\s*=\s*["\']((?:https?|ftp|magnet):[^"\']+)["\']', re.I)
+_MD_LINK_RE = re.compile(r"\]\(\s*((?:https?|ftp|magnet):[^\s\)]+)\s*\)", re.I)
+_HTML_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+_SPLIT_ARCH_RE = re.compile(r"\.(?:zip|rar|7z)\.\d{3}$")
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg", ".ts", ".ogv", ".3gp",
 }
+
+CATEGORY_EXTENSIONS: Dict[str, set[str]] = {
+    "music": {".mp3", ".flac", ".wav", ".aac", ".ogg", ".opus", ".m4a", ".wma", ".aiff", ".alac", ".mid", ".midi"},
+    "compressed": {
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst", ".tgz", ".tbz2",
+        ".iso", ".cab", ".lzma", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst",
+    },
+    "videos": VIDEO_EXTENSIONS,
+    "programs": {
+        ".exe", ".msi", ".deb", ".rpm", ".appimage", ".flatpak", ".snap", ".sh",
+        ".bin", ".dmg", ".pkg", ".run", ".jar", ".bat", ".cmd",
+    },
+    "documents": {
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv",
+        ".odt", ".ods", ".odp", ".rtf", ".epub", ".mobi", ".md", ".json", ".xml",
+    },
+    "apks": {".apk", ".xapk", ".apkm", ".apks"},
+    "images": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico", ".tiff", ".tif", ".heic", ".avif", ".raw"},
+}
+
+CATEGORY_ICONS: Dict[str, str] = {
+    "music": "audio-x-generic-symbolic",
+    "compressed": "package-x-generic-symbolic",
+    "videos": "video-x-generic-symbolic",
+    "programs": "application-x-executable-symbolic",
+    "documents": "x-office-document-symbolic",
+    "apks": "phone-symbolic",
+    "images": "image-x-generic-symbolic",
+    "other": "text-x-generic-symbolic",
+}
+
+SIDEBAR_CATEGORIES: list[tuple[str, str, str]] = [
+    ("music", "Música", "audio-x-generic-symbolic"),
+    ("compressed", "Comprimidos", "package-x-generic-symbolic"),
+    ("videos", "Videos", "video-x-generic-symbolic"),
+    ("programs", "Programas", "application-x-executable-symbolic"),
+    ("documents", "Documentos", "x-office-document-symbolic"),
+    ("apks", "APKs", "phone-symbolic"),
+    ("images", "Imágenes", "image-x-generic-symbolic"),
+]
+
+
+def classify_download_category(item: DownloadItem) -> str:
+    """Classify a download item into sidebar categories matching its file extension or extractor."""
+    ext = (item.file_extension or "").lower().strip()
+    if _SPLIT_ARCH_RE.search(ext):
+        return "compressed"
+    for cat_key, exts in CATEGORY_EXTENSIONS.items():
+        if ext in exts:
+            return cat_key
+    if item.extractor_type == "video":
+        if str(item.extra.get("quality") or "").lower() == "audio" or ext == ".mp3":
+            return "music"
+        return "videos"
+    return "other"
+
+
+def format_progress_percent(pct: float, status: str) -> str:
+    """Format progress percentage crisply (e.g. '0%', '80%', '84.6%', '100%')."""
+    if status == "complete" or pct >= 99.95:
+        return "100%"
+    if pct <= 0.0:
+        return "0%"
+    if abs(pct - round(pct)) < 0.05:
+        return f"{int(round(pct))}%"
+    return f"{pct:.1f}%"
 
 
 class _HTMLAnchorExtractor(HTMLParser):
@@ -52,7 +123,7 @@ class _HTMLAnchorExtractor(HTMLParser):
             candidate = attr_dict.get("src", "")
         if candidate:
             candidate = html.unescape(candidate).strip()
-            if re.match(r"^(?:https?|ftp|magnet):", candidate, re.I):
+            if _ALLOWED_SCHEMES_RE.match(candidate):
                 self.links.append(candidate)
 
 
@@ -78,18 +149,18 @@ def extract_urls_from_html_or_text(raw_content: str, base_only_from_href: bool =
             found.extend(parser.links)
         except Exception:
             pass
-        for m_href in re.finditer(r'href\s*=\s*["\']((?:https?|ftp|magnet):[^"\']+)["\']', raw_content, re.I):
+        for m_href in _HREF_RE.finditer(raw_content):
             found.append(html.unescape(m_href.group(1).strip()))
 
     if base_only_from_href and found:
         return list(dict.fromkeys(found))
 
     # 2. Parse Markdown links [Texto representativo](https://...)
-    for m_md in re.finditer(r"\]\(\s*((?:https?|ftp|magnet):[^\s\)]+)\s*\)", raw_content, re.I):
+    for m_md in _MD_LINK_RE.finditer(raw_content):
         found.append(m_md.group(1).strip())
 
     # 3. Extract any bare URLs in the text, stripping trailing punctuation
-    cleaned_text = re.sub(r"<[^>]+>", " ", raw_content) if "<" in raw_content else raw_content
+    cleaned_text = _HTML_TAG_STRIP_RE.sub(" ", raw_content) if "<" in raw_content else raw_content
     for u in URL_EXTRACT_RE.findall(cleaned_text):
         u_clean = u.rstrip(".,;:)]}>\"'")
         if u_clean:
@@ -153,6 +224,7 @@ def read_clipboard_urls_async(clipboard: Gdk.Clipboard, callback: Callable[[List
                 return
 
             chunks: List[bytes] = []
+            total_bytes = [0]
 
             def _read_next_chunk(st: Gio.InputStream, r: Gio.AsyncResult) -> None:
                 if finished["done"]:
@@ -167,8 +239,9 @@ def read_clipboard_urls_async(clipboard: Gdk.Clipboard, callback: Callable[[List
                 except Exception:
                     data = b""
 
-                if data and sum(len(c) for c in chunks) < 512 * 1024:
+                if data and total_bytes[0] < 512 * 1024:
                     chunks.append(data)
+                    total_bytes[0] += len(data)
                     st.read_bytes_async(
                         65536,
                         GLib.PRIORITY_DEFAULT,
@@ -319,10 +392,13 @@ class DownloadRowObject(GObject.Object):
         self.host: str = ""
         self.size_str: str = ""
         self.progress_fraction: float = 0.0
-        self.progress_text: str = "0.0%"
+        self.progress_text: str = "0%"
         self.speed_str: str = "0.00 MB/s"
         self.eta_str: str = "—"
         self.status_str: str = ""
+        self.status_raw: str = ""
+        self.category: str = "other"
+        self.icon_name: str = "text-x-generic-symbolic"
         self.sync_from_item(item)
 
     def sync_from_item(self, item: DownloadItem) -> bool:
@@ -340,10 +416,13 @@ class DownloadRowObject(GObject.Object):
             new_size = "—"
 
         new_frac = item.progress_fraction
-        new_prog_txt = f"{item.progress_percent:.1f}%"
+        new_prog_txt = format_progress_percent(item.progress_percent, item.status)
         new_speed = format_speed_mbs(item.speed)
         new_eta = format_eta(item.eta) if item.status == "active" else "—"
         new_status = item.status_display
+        new_status_raw = item.status
+        new_category = classify_download_category(item)
+        new_icon_name = CATEGORY_ICONS.get(new_category, "text-x-generic-symbolic")
 
         changed = (
             self.filename != new_filename
@@ -357,6 +436,9 @@ class DownloadRowObject(GObject.Object):
             or self.speed_str != new_speed
             or self.eta_str != new_eta
             or self.status_str != new_status
+            or self.status_raw != new_status_raw
+            or self.category != new_category
+            or self.icon_name != new_icon_name
         )
         if changed:
             self.filename = new_filename
@@ -370,6 +452,9 @@ class DownloadRowObject(GObject.Object):
             self.speed_str = new_speed
             self.eta_str = new_eta
             self.status_str = new_status
+            self.status_raw = new_status_raw
+            self.category = new_category
+            self.icon_name = new_icon_name
         return changed
 
 
@@ -380,15 +465,23 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Mint Downloader")
         self.runner = runner
         self.engine = runner.engine
-        self.set_default_size(1060, 620)
+        self.set_default_size(1160, 680)
         self._setup_app_icon()
 
         self._row_map: Dict[int, DownloadRowObject] = {}
         self._item_widgets: Dict[int, Dict[str, Gtk.Widget]] = {}
         self._seen_clipboard_links: set[str] = set()
         self._tick_counter: int = 0
+        self._last_state_version: int = -1
+        self._last_stats: tuple[float, int, int] = (-1.0, -1, -1)
+        self._swatch_css_loaded: bool = False
         self._active_container_filter: str = "Todos"
         self._known_containers: List[str] = ["Todos", "General"]
+        self._active_status_filter: str = "all"
+        self._active_category_filter: str = "all"
+        self._search_query: str = ""
+        self._syncing_select_all: bool = False
+        self._sidebar_row_widgets: Dict[tuple[str, str], Gtk.Widget] = {}
         self._active_chooser: Optional[Gtk.Widget] = None
         self._theme_provider = Gtk.CssProvider()
         display = Gdk.Display.get_default()
@@ -422,55 +515,263 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
 
     def _apply_css(self) -> None:
         css = b"""
-        .toolbar-deck {
-            padding: 6px 12px;
-            background: linear-gradient(180deg, alpha(@headerbar_bg_color, 0.96), alpha(@window_bg_color, 0.98));
-            border-bottom: 1px solid alpha(currentColor, 0.14);
-        }
-        .toolbar-row {
-            padding: 2px 0px;
-        }
-        .pro-btn {
-            min-height: 26px;
-            padding: 3px 10px;
-            border-radius: 7px;
-            font-size: 0.88em;
-            font-weight: 600;
+        /* --- Base structural styling --- */
+        .header-strip {
+            padding: 10px 14px 8px 14px;
         }
         .app-title-badge {
             font-weight: 800;
-            font-size: 0.95em;
-            letter-spacing: 0.3px;
-            margin-right: 4px;
+            font-size: 1.02em;
+            letter-spacing: 0.4px;
+        }
+        .bridge-badge {
+            font-size: 0.80em;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 99px;
+            background: rgba(16, 185, 129, 0.14);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.30);
+        }
+        .search-entry {
+            min-width: 240px;
+            min-height: 34px;
+            border-radius: 10px;
+            padding: 0px 8px;
+        }
+        .body-split {
+            margin: 2px 14px 10px 14px;
+        }
+        .sidebar-card {
+            border-radius: 12px;
+            padding: 10px 8px;
+        }
+        .sidebar-group-row {
+            border-radius: 8px;
+            padding: 1px 2px;
+            transition: background-color 150ms ease;
+        }
+        .sidebar-main-btn {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            padding: 7px 8px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 0.90em;
+        }
+        .sidebar-chevron-btn {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            min-width: 26px;
+            min-height: 26px;
+            padding: 4px;
+            border-radius: 6px;
+            opacity: 0.75;
+        }
+        .sidebar-sub-btn {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            padding: 6px 10px 6px 24px;
+            border-radius: 8px;
+            font-weight: 500;
+            font-size: 0.88em;
+        }
+        .toolbar-deck {
+            padding: 10px 12px;
+            border-radius: 12px;
+        }
+        .pro-btn {
+            min-width: 96px;
+            min-height: 54px;
+            padding: 6px 8px;
+            border-radius: 10px;
+            font-size: 0.78em;
+            font-weight: 600;
+            box-shadow: none;
+            transition: all 140ms ease;
+        }
+        .table-card {
+            border-radius: 12px;
+        }
+        .table-footer {
+            padding: 7px 14px;
+            font-size: 0.84em;
         }
         .status-bar {
-            padding: 5px 12px;
-            border-top: 1px solid alpha(currentColor, 0.14);
-            font-size: 0.88em;
+            padding: 8px 14px;
+            font-size: 0.86em;
         }
         .speed-badge {
             font-weight: 700;
-            color: #10b981;
+            color: #34d399;
         }
-        .bridge-badge {
+        .progress-pct-label {
             font-size: 0.82em;
-            color: #38bdf8;
             font-weight: 600;
         }
-        progressbar {
+        progressbar.slim-progress {
             min-width: 0px;
         }
-        progressbar trough {
+        progressbar.slim-progress trough {
             min-width: 0px;
-            min-height: 16px;
+            min-height: 6px;
+            border-radius: 99px;
         }
-        progressbar progress {
+        progressbar.slim-progress progress {
             min-width: 0px;
-            min-height: 16px;
+            min-height: 6px;
+            border-radius: 99px;
+            background-image: linear-gradient(90deg, #10b981, #34d399);
+            background-color: #10b981;
         }
-        progressbar text {
-            font-size: 0.80em;
-            font-weight: 600;
+
+        /* --- Default Mint Sleek Dark Theme (inspired by reference card layout) --- */
+        .mint-default-root {
+            background-color: #12141a;
+            color: #e2e8f0;
+        }
+        .mint-default-root label {
+            color: #e2e8f0;
+        }
+        .mint-default-root .header-strip {
+            background-color: #12141a;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .mint-default-root .search-entry {
+            background-color: #1b1e28;
+            color: #f8fafc;
+            border: 1px solid rgba(255, 255, 255, 0.09);
+        }
+        .mint-default-root .search-entry:focus-within {
+            border-color: rgba(16, 185, 129, 0.65);
+        }
+        .mint-default-root .sidebar-card,
+        .mint-default-root .toolbar-deck,
+        .mint-default-root .table-card {
+            background-color: #181b24;
+            border: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        .mint-default-root .sidebar-group-row:hover,
+        .mint-default-root .sidebar-sub-btn:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        .mint-default-root .sidebar-active {
+            background-color: rgba(16, 185, 129, 0.16);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+        }
+        .mint-default-root .sidebar-active label,
+        .mint-default-root .sidebar-active image {
+            color: #34d399;
+        }
+        .mint-default-root .pro-btn {
+            background-color: rgba(255, 255, 255, 0.04);
+            background-image: none;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            color: #e2e8f0;
+        }
+        .mint-default-root .pro-btn:hover {
+            background-color: rgba(255, 255, 255, 0.09);
+            border-color: rgba(16, 185, 129, 0.45);
+        }
+        .mint-default-root .pro-btn:active {
+            background-color: rgba(16, 185, 129, 0.22);
+        }
+        .mint-default-root .pro-btn-primary {
+            background-image: linear-gradient(135deg, #10b981, #059669);
+            background-color: #10b981;
+            border: 1px solid rgba(52, 211, 153, 0.55);
+            color: #ffffff;
+        }
+        .mint-default-root .pro-btn-primary:hover {
+            background-image: linear-gradient(135deg, #34d399, #10b981);
+            border-color: #6ee7b7;
+        }
+        .mint-default-root .pro-btn-primary label,
+        .mint-default-root .pro-btn-primary image {
+            color: #ffffff;
+        }
+        .mint-default-root .toolbar-deck separator,
+        .mint-default-root .table-card separator,
+        .mint-default-root .status-bar separator {
+            background-color: rgba(255, 255, 255, 0.10);
+        }
+        .mint-default-root dropdown button,
+        .mint-default-root menubutton button,
+        .mint-default-root spinbutton {
+            background-color: #202430;
+            background-image: none;
+            color: #e2e8f0;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 8px;
+        }
+        .mint-default-root popover contents {
+            background-color: #1e222e;
+            color: #e2e8f0;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+        }
+        .mint-default-root popover modelbutton:hover,
+        .mint-default-root popover row:hover {
+            background-color: rgba(16, 185, 129, 0.20);
+        }
+        .mint-default-root .table-area,
+        .mint-default-root .table-area columnview,
+        .mint-default-root .table-area columnview > listview {
+            background-color: transparent;
+            color: #e2e8f0;
+        }
+        .mint-default-root .table-area columnview > header {
+            background-color: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .mint-default-root .table-area columnview > header button {
+            background-color: transparent;
+            background-image: none;
+            color: #94a3b8;
+            font-weight: 700;
+            font-size: 0.86em;
+            border-color: rgba(255, 255, 255, 0.05);
+            box-shadow: none;
+        }
+        .mint-default-root .table-area columnview > listview > row {
+            background-color: transparent;
+            color: #e2e8f0;
+            border-radius: 6px;
+        }
+        .mint-default-root .table-area columnview > listview > row:hover {
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+        .mint-default-root .table-area columnview > listview > row:selected {
+            background-color: rgba(16, 185, 129, 0.24);
+            color: #ffffff;
+        }
+        .mint-default-root .table-area progressbar.slim-progress trough {
+            background-color: rgba(255, 255, 255, 0.11);
+        }
+        .mint-default-root .table-footer {
+            background-color: rgba(0, 0, 0, 0.14);
+            border-bottom-left-radius: 12px;
+            border-bottom-right-radius: 12px;
+        }
+        .mint-default-root .muted-label {
+            color: #94a3b8;
+        }
+        .mint-default-root checkbutton check {
+            background-color: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.28);
+            border-radius: 5px;
+        }
+        .mint-default-root checkbutton check:checked,
+        .mint-default-root checkbutton check:indeterminate {
+            background-color: #10b981;
+            border-color: #34d399;
+            color: #ffffff;
+        }
+        .mint-default-root .status-bar {
+            background-color: #161922;
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
         }
         """
         provider = Gtk.CssProvider()
@@ -490,9 +791,11 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
 
         if mode == "default" or (mode == "image" and not os.path.isfile(img_path)):
             self._root_box.remove_css_class("custom-bg-root")
+            self._root_box.add_css_class("mint-default-root")
             self._theme_provider.load_from_data(b"")
             return
 
+        self._root_box.remove_css_class("mint-default-root")
         self._root_box.add_css_class("custom-bg-root")
 
         if mode == "color":
@@ -502,19 +805,28 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             lum = 0.299 * rgba.red + 0.587 * rgba.green + 0.114 * rgba.blue
             is_dark = lum < 0.55
             fg = "#f8fafc" if is_dark else "#0f172a"
-            header_bg = "rgba(15, 23, 42, 0.45)" if is_dark else "rgba(255, 255, 255, 0.55)"
+            muted_fg = "#cbd5e1" if is_dark else "#475569"
+            card_bg = "rgba(15, 23, 42, 0.56)" if is_dark else "rgba(255, 255, 255, 0.68)"
+            btn_bg = "rgba(255, 255, 255, 0.08)" if is_dark else "rgba(15, 23, 42, 0.06)"
+            btn_hover = "rgba(255, 255, 255, 0.16)" if is_dark else "rgba(15, 23, 42, 0.12)"
             row_hover = "rgba(255, 255, 255, 0.10)" if is_dark else "rgba(15, 23, 42, 0.08)"
-            row_sel = "rgba(16, 185, 129, 0.40)" if is_dark else "rgba(16, 185, 129, 0.30)"
+            row_sel = "rgba(16, 185, 129, 0.38)" if is_dark else "rgba(16, 185, 129, 0.28)"
             sep_col = "rgba(255, 255, 255, 0.14)" if is_dark else "rgba(15, 23, 42, 0.14)"
+            trough_bg = "rgba(255, 255, 255, 0.16)" if is_dark else "rgba(15, 23, 42, 0.16)"
+            pop_bg = "#1e293b" if is_dark else "#f8fafc"
             bg_rule = f"background-color: {rgba.to_string()}; background-image: none;"
         else:
-            # Custom background image
             uri = GLib.filename_to_uri(os.path.abspath(img_path), None)
             fg = "#f8fafc"
-            header_bg = "rgba(15, 23, 42, 0.62)"
+            muted_fg = "#cbd5e1"
+            card_bg = "rgba(15, 23, 42, 0.65)"
+            btn_bg = "rgba(255, 255, 255, 0.08)"
+            btn_hover = "rgba(255, 255, 255, 0.16)"
             row_hover = "rgba(255, 255, 255, 0.12)"
-            row_sel = "rgba(16, 185, 129, 0.45)"
+            row_sel = "rgba(16, 185, 129, 0.42)"
             sep_col = "rgba(255, 255, 255, 0.16)"
+            trough_bg = "rgba(255, 255, 255, 0.18)"
+            pop_bg = "#1e293b"
             alpha_str = f"{opacity:.2f}"
             bg_rule = (
                 f'background-image: linear-gradient(rgba(15, 23, 42, {alpha_str}), rgba(15, 23, 42, {alpha_str})), url("{uri}"); '
@@ -524,19 +836,70 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         css = f"""
         .custom-bg-root {{
             {bg_rule}
+            color: {fg};
         }}
-        .custom-bg-root .toolbar-deck {{
-            background: {header_bg};
+        .custom-bg-root label {{
+            color: {fg};
+        }}
+        .custom-bg-root .muted-label {{
+            color: {muted_fg};
+        }}
+        .custom-bg-root .header-strip {{
+            background: {card_bg};
             border-bottom: 1px solid {sep_col};
         }}
-        .custom-bg-root .status-bar {{
-            background: {header_bg};
-            border-top: 1px solid {sep_col};
-        }}
-        .custom-bg-root .toolbar-deck > box > label,
-        .custom-bg-root .status-bar > label,
-        .custom-bg-root .status-bar box > label {{
+        .custom-bg-root .search-entry {{
+            background-color: {card_bg};
             color: {fg};
+            border: 1px solid {sep_col};
+        }}
+        .custom-bg-root .sidebar-card,
+        .custom-bg-root .toolbar-deck,
+        .custom-bg-root .table-card,
+        .custom-bg-root .status-bar {{
+            background: {card_bg};
+            border: 1px solid {sep_col};
+        }}
+        .custom-bg-root .sidebar-group-row:hover,
+        .custom-bg-root .sidebar-sub-btn:hover {{
+            background-color: {row_hover};
+        }}
+        .custom-bg-root .sidebar-active {{
+            background-color: rgba(16, 185, 129, 0.24);
+            border: 1px solid rgba(16, 185, 129, 0.55);
+        }}
+        .custom-bg-root .pro-btn {{
+            background-color: {btn_bg};
+            background-image: none;
+            color: {fg};
+            border: 1px solid {sep_col};
+        }}
+        .custom-bg-root .pro-btn:hover {{
+            background-color: {btn_hover};
+        }}
+        .custom-bg-root .pro-btn-primary {{
+            background-image: linear-gradient(135deg, #10b981, #059669);
+            background-color: #10b981;
+            border: 1px solid rgba(52, 211, 153, 0.60);
+            color: #ffffff;
+        }}
+        .custom-bg-root .pro-btn-primary label,
+        .custom-bg-root .pro-btn-primary image {{
+            color: #ffffff;
+        }}
+        .custom-bg-root dropdown button,
+        .custom-bg-root menubutton button,
+        .custom-bg-root spinbutton {{
+            background-color: {btn_bg};
+            background-image: none;
+            color: {fg};
+            border: 1px solid {sep_col};
+            border-radius: 8px;
+        }}
+        .custom-bg-root popover contents {{
+            background-color: {pop_bg};
+            color: {fg};
+            border: 1px solid {sep_col};
         }}
         .custom-bg-root .table-area,
         .custom-bg-root .table-area columnview,
@@ -546,7 +909,8 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             color: {fg};
         }}
         .custom-bg-root .table-area columnview > header button {{
-            background-color: {header_bg};
+            background-color: transparent;
+            background-image: none;
             color: {fg};
             border-color: {sep_col};
         }}
@@ -563,6 +927,12 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         .custom-bg-root .table-area columnview label {{
             color: {fg};
         }}
+        .custom-bg-root .table-area progressbar.slim-progress trough {{
+            background-color: {trough_bg};
+        }}
+        .custom-bg-root .table-footer {{
+            border-top: 1px solid {sep_col};
+        }}
         """.encode("utf-8")
         self._theme_provider.load_from_data(css)
 
@@ -570,50 +940,214 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         btn = Gtk.Button()
         btn.add_css_class("pro-btn")
         btn.set_tooltip_text(tooltip)
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        btn.set_valign(Gtk.Align.FILL)
+        btn.set_halign(Gtk.Align.FILL)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
         img = Gtk.Image.new_from_icon_name(icon_name)
-        img.set_pixel_size(14)
+        img.set_pixel_size(18)
+        img.set_halign(Gtk.Align.CENTER)
+
         lbl = Gtk.Label(label=label_text)
+        lbl.set_justify(Gtk.Justification.CENTER)
+        lbl.set_halign(Gtk.Align.CENTER)
+        lbl.set_wrap(True)
+        lbl.set_wrap_mode(Pango.WrapMode.WORD)
+        lbl.set_lines(2)
+        lbl.set_max_width_chars(13)
+
         box.append(img)
         box.append(lbl)
         btn.set_child(box)
         btn.connect("clicked", callback)
+        if hasattr(self, "_toolbar_size_group"):
+            self._toolbar_size_group.add_widget(btn)
         return btn
+
+    def _build_sidebar_group(
+        self,
+        group_key: str,
+        title: str,
+        icon_name: str,
+        default_expanded: bool = False,
+    ) -> Gtk.Box:
+        wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+
+        group_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        group_row.add_css_class("sidebar-group-row")
+
+        btn_main = Gtk.Button()
+        btn_main.add_css_class("sidebar-main-btn")
+        btn_main.set_hexpand(True)
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_icon = Gtk.Image.new_from_icon_name(icon_name)
+        btn_icon.set_pixel_size(16)
+        btn_lbl = Gtk.Label(label=title, xalign=0.0)
+        btn_lbl.set_hexpand(True)
+        btn_box.append(btn_icon)
+        btn_box.append(btn_lbl)
+        btn_main.set_child(btn_box)
+        btn_main.connect("clicked", lambda _b, gk=group_key: self._select_sidebar_filter(gk, "all"))
+
+        chevron_icon = Gtk.Image.new_from_icon_name(
+            "pan-up-symbolic" if default_expanded else "pan-down-symbolic"
+        )
+        chevron_icon.set_pixel_size(14)
+        btn_chevron = Gtk.Button()
+        btn_chevron.add_css_class("sidebar-chevron-btn")
+        btn_chevron.set_child(chevron_icon)
+        btn_chevron.set_tooltip_text(f"Mostrar u ocultar categorías de {title}")
+
+        group_row.append(btn_main)
+        group_row.append(btn_chevron)
+        wrapper.append(group_row)
+        self._sidebar_row_widgets[(group_key, "all")] = group_row
+
+        revealer = Gtk.Revealer()
+        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        revealer.set_reveal_child(default_expanded)
+
+        sub_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        sub_box.set_margin_bottom(6)
+        for cat_key, cat_label, cat_icon in SIDEBAR_CATEGORIES:
+            sub_btn = Gtk.Button()
+            sub_btn.add_css_class("sidebar-sub-btn")
+            row_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            ic = Gtk.Image.new_from_icon_name(cat_icon)
+            ic.set_pixel_size(15)
+            lb = Gtk.Label(label=cat_label, xalign=0.0)
+            lb.set_hexpand(True)
+            row_content.append(ic)
+            row_content.append(lb)
+            sub_btn.set_child(row_content)
+            sub_btn.connect(
+                "clicked",
+                lambda _b, gk=group_key, ck=cat_key: self._select_sidebar_filter(gk, ck),
+            )
+            sub_box.append(sub_btn)
+            self._sidebar_row_widgets[(group_key, cat_key)] = sub_btn
+
+        revealer.set_child(sub_box)
+        wrapper.append(revealer)
+
+        def _toggle_expand(_b) -> None:
+            new_state = not revealer.get_reveal_child()
+            revealer.set_reveal_child(new_state)
+            chevron_icon.set_from_icon_name("pan-up-symbolic" if new_state else "pan-down-symbolic")
+
+        btn_chevron.connect("clicked", _toggle_expand)
+        return wrapper
+
+    def _select_sidebar_filter(self, group_key: str, category_key: str) -> None:
+        self._active_status_filter = group_key
+        self._active_category_filter = category_key
+        self._update_sidebar_active_styles()
+        self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self._update_selection_footer()
+
+    def _update_sidebar_active_styles(self) -> None:
+        active_pair = (self._active_status_filter, self._active_category_filter)
+        for pair, widget in self._sidebar_row_widgets.items():
+            if pair == active_pair:
+                widget.add_css_class("sidebar-active")
+            else:
+                widget.remove_css_class("sidebar-active")
 
     def _build_ui(self) -> None:
         root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._root_box = root_box
         self.set_child(root_box)
 
-        # 1. Stylish 2-Row Pro Control Deck (Half buttons on Top Row, Half on Bottom Row)
-        deck_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        deck_box.add_css_class("toolbar-deck")
-
-        row_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        row_top.add_css_class("toolbar-row")
-
-        row_bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        row_bottom.add_css_class("toolbar-row")
+        # 1. Top Header Strip (Brand + Extension status on left, Search bar on right)
+        header_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header_strip.add_css_class("header-strip")
 
         logo_path = Path(__file__).resolve().parent.parent / "assets" / "mint-downloader.svg"
         if logo_path.is_file():
             logo_img = Gtk.Image.new_from_file(str(logo_path))
             logo_img.set_pixel_size(24)
-            logo_img.set_tooltip_text("Mint Downloader Pro")
-            row_top.append(logo_img)
+            logo_img.set_tooltip_text("Gestor de Descargas Mint")
+            header_strip.append(logo_img)
 
         brand_lbl = Gtk.Label(label="MINT DL")
         brand_lbl.add_css_class("app-title-badge")
-        row_top.append(brand_lbl)
+        header_strip.append(brand_lbl)
 
-        # --- TOP ROW: Primary Queue Actions (5 buttons) ---
+        bridge_lbl = Gtk.Label(label="● Extensión Firefox IDM activa (127.0.0.1:16890)")
+        bridge_lbl.add_css_class("bridge-badge")
+        header_strip.append(bridge_lbl)
+
+        hdr_spacer = Gtk.Box()
+        hdr_spacer.set_hexpand(True)
+        header_strip.append(hdr_spacer)
+
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.add_css_class("search-entry")
+        self.search_entry.set_placeholder_text("Buscar en la lista...")
+        self.search_entry.set_tooltip_text("Buscar por nombre, extensión, origen o estado")
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        header_strip.append(self.search_entry)
+
+        root_box.append(header_strip)
+
+        # 2. Main Split Body: Left Category Sidebar + Right Workspace
+        body_split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        body_split.add_css_class("body-split")
+        body_split.set_vexpand(True)
+        body_split.set_hexpand(True)
+
+        # --- LEFT SIDEBAR (Categories only, NO Disk Space panel) ---
+        sidebar_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sidebar_card.add_css_class("sidebar-card")
+        sidebar_card.set_size_request(215, -1)
+        sidebar_card.set_hexpand(False)
+        sidebar_card.set_vexpand(True)
+
+        sidebar_scroll = Gtk.ScrolledWindow()
+        sidebar_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sidebar_scroll.set_vexpand(True)
+
+        sidebar_items_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sidebar_items_box.append(
+            self._build_sidebar_group("all", "Todas las descargas", "folder-download-symbolic", default_expanded=True)
+        )
+        sidebar_items_box.append(
+            self._build_sidebar_group("unfinished", "Sin terminar", "folder-open-symbolic", default_expanded=False)
+        )
+        sidebar_items_box.append(
+            self._build_sidebar_group("finished", "Terminadas", "folder-symbolic", default_expanded=False)
+        )
+        sidebar_scroll.set_child(sidebar_items_box)
+        sidebar_card.append(sidebar_scroll)
+        self._update_sidebar_active_styles()
+
+        body_split.append(sidebar_card)
+
+        # --- RIGHT WORKSPACE (2-Row Equal-Size Vertical-Icon Action Deck + Table Card) ---
+        right_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        right_panel.set_hexpand(True)
+        right_panel.set_vexpand(True)
+
+        # Action Deck with Uniform Equal-Sized Buttons (Icon Above + Text Below) in Organized 2 Rows
+        self._toolbar_size_group = Gtk.SizeGroup.new(Gtk.SizeGroupMode.BOTH)
+
+        deck_card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        deck_card.add_css_class("toolbar-deck")
+
+        btn_grid = Gtk.Grid()
+        btn_grid.set_row_spacing(6)
+        btn_grid.set_column_spacing(6)
+
         self.btn_add = self._make_toolbar_button(
             "list-add-symbolic",
             "Agregar enlaces",
-            "Pegar enlaces (YouTube con selector de calidades, MEGA, MediaFire, Magnet, hipervínculos HTML)",
+            "Pegar enlaces (YouTube con selector de calidades, MEGA, MediaFire, enlaces magnéticos e hipervínculos HTML)",
             self._on_add_links_clicked,
         )
-        self.btn_add.add_css_class("suggested-action")
+        self.btn_add.add_css_class("pro-btn-primary")
 
         self.btn_torrent = self._make_toolbar_button(
             "document-open-symbolic",
@@ -621,7 +1155,6 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             "Agregar archivo .torrent local o enlace magnético BitTorrent",
             self._on_add_torrent_clicked,
         )
-
         self.btn_start = self._make_toolbar_button(
             "media-playback-start-symbolic",
             "Iniciar",
@@ -640,23 +1173,13 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             "Detener descargas seleccionadas",
             self._on_stop_clicked,
         )
+        self.btn_browser = self._make_toolbar_button(
+            "web-browser-symbolic",
+            "Verificar en navegador",
+            "Abrir enlace seleccionado en el navegador para capturar descarga directa automáticamente",
+            self._on_open_in_browser_clicked,
+        )
 
-        row_top.append(self.btn_add)
-        row_top.append(self.btn_torrent)
-        row_top.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        row_top.append(self.btn_start)
-        row_top.append(self.btn_pause)
-        row_top.append(self.btn_stop)
-
-        top_spacer = Gtk.Box()
-        top_spacer.set_hexpand(True)
-        row_top.append(top_spacer)
-
-        bridge_lbl = Gtk.Label(label="● Extensión Firefox IDM activa (127.0.0.1:16890)")
-        bridge_lbl.add_css_class("bridge-badge")
-        row_top.append(bridge_lbl)
-
-        # --- BOTTOM ROW: Organization, Cleanup, Browser & Folders (5 buttons + filter) ---
         self.btn_remove = self._make_toolbar_button(
             "user-trash-symbolic",
             "Eliminar",
@@ -674,12 +1197,6 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             "Contenedor",
             "Agrupar enlaces seleccionados en un contenedor / paquete",
             self._on_assign_container_clicked,
-        )
-        self.btn_browser = self._make_toolbar_button(
-            "web-browser-symbolic",
-            "Verificar en navegador",
-            "Abrir enlace seleccionado en el navegador para capturar descarga directa automáticamente",
-            self._on_open_in_browser_clicked,
         )
         self.btn_open_dir = self._make_toolbar_button(
             "folder-symbolic",
@@ -700,43 +1217,65 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             self._on_theme_clicked,
         )
 
-        row_bottom.append(self.btn_remove)
-        row_bottom.append(self.btn_clear_completed)
-        row_bottom.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        row_bottom.append(self.btn_container)
+        # Row 0 (Enlaces, Control y Navegador)
+        btn_grid.attach(self.btn_add, 0, 0, 1, 1)
+        btn_grid.attach(self.btn_torrent, 1, 0, 1, 1)
+        sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep1.set_margin_start(3)
+        sep1.set_margin_end(3)
+        btn_grid.attach(sep1, 2, 0, 1, 2)
+        btn_grid.attach(self.btn_start, 3, 0, 1, 1)
+        btn_grid.attach(self.btn_pause, 4, 0, 1, 1)
+        btn_grid.attach(self.btn_stop, 5, 0, 1, 1)
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep2.set_margin_start(3)
+        sep2.set_margin_end(3)
+        btn_grid.attach(sep2, 6, 0, 1, 2)
+        btn_grid.attach(self.btn_browser, 7, 0, 1, 1)
 
-        filter_lbl = Gtk.Label(label="Paquete:")
-        filter_lbl.set_margin_start(4)
-        row_bottom.append(filter_lbl)
+        # Row 1 (Limpieza, Contenedor, Carpetas y Fondo — aligned directly below Row 0)
+        btn_grid.attach(self.btn_remove, 0, 1, 1, 1)
+        btn_grid.attach(self.btn_clear_completed, 1, 1, 1, 1)
+        btn_grid.attach(self.btn_container, 3, 1, 1, 1)
+        btn_grid.attach(self.btn_open_dir, 4, 1, 1, 1)
+        btn_grid.attach(self.btn_folder, 5, 1, 1, 1)
+        btn_grid.attach(self.btn_theme, 7, 1, 1, 1)
+
+        deck_card.append(btn_grid)
+
+        deck_spacer = Gtk.Box()
+        deck_spacer.set_hexpand(True)
+        deck_card.append(deck_spacer)
+
+        pkg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        pkg_box.set_valign(Gtk.Align.CENTER)
+        filter_lbl = Gtk.Label(label="Paquete:", xalign=0.0)
+        filter_lbl.add_css_class("muted-label")
         self.container_filter_model = Gtk.StringList.new(["Todos", "General"])
         self.container_filter_dropdown = Gtk.DropDown(model=self.container_filter_model)
-        self.container_filter_dropdown.set_tooltip_text("Filtrar lista por contenedor/paquete")
+        self.container_filter_dropdown.set_tooltip_text("Filtrar lista por contenedor / paquete")
         self.container_filter_dropdown.connect("notify::selected", self._on_container_filter_changed)
-        row_bottom.append(self.container_filter_dropdown)
+        pkg_box.append(filter_lbl)
+        pkg_box.append(self.container_filter_dropdown)
+        deck_card.append(pkg_box)
 
-        row_bottom.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        row_bottom.append(self.btn_browser)
+        right_panel.append(deck_card)
 
-        bottom_spacer = Gtk.Box()
-        bottom_spacer.set_hexpand(True)
-        row_bottom.append(bottom_spacer)
-        row_bottom.append(self.btn_theme)
-        row_bottom.append(self.btn_open_dir)
-        row_bottom.append(self.btn_folder)
+        # 3. Main Real-Time Download Table Card
+        table_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        table_card.add_css_class("table-card")
+        table_card.set_vexpand(True)
+        table_card.set_hexpand(True)
 
-        deck_box.append(row_top)
-        deck_box.append(row_bottom)
-        root_box.append(deck_box)
-
-        # 2. Main Real-Time Download Table (Gtk.ColumnView with Mouse Drag Rubberband Multi-Selection)
         self.list_store = Gio.ListStore.new(DownloadRowObject)
         self.custom_filter = Gtk.CustomFilter.new(self._filter_row_by_container, None)
         self.filter_list_model = Gtk.FilterListModel.new(self.list_store, self.custom_filter)
         self.selection_model = Gtk.MultiSelection.new(self.filter_list_model)
+        self.selection_model.connect("selection-changed", self._on_table_selection_changed)
 
         self.column_view = Gtk.ColumnView.new(self.selection_model)
         self.column_view.set_show_row_separators(True)
-        self.column_view.set_show_column_separators(True)
+        self.column_view.set_show_column_separators(False)
         self.column_view.set_enable_rubberband(True)
         self.column_view.set_single_click_activate(False)
         self.column_view.set_vexpand(True)
@@ -752,14 +1291,14 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         )
         self.column_view.add_controller(shortcut_ctrl)
 
-        self._add_text_column("Nombre", "filename", expand=True, min_width=220)
-        self._add_text_column("Contenedor", "file_ext", expand=False, min_width=100)
-        self._add_text_column("Origen", "origin", expand=False, min_width=130)
-        self._add_text_column("Tamaño", "size_str", expand=False, min_width=140)
-        self._add_progress_column("Progreso", min_width=170)
-        self._add_text_column("Velocidad", "speed_str", expand=False, min_width=110)
+        self._add_name_column("Nombre", expand=True, min_width=230)
+        self._add_text_column("Contenedor", "file_ext", expand=False, min_width=95)
+        self._add_text_column("Origen", "origin", expand=False, min_width=125)
+        self._add_text_column("Tamaño", "size_str", expand=False, min_width=135)
+        self._add_progress_column("Progreso", min_width=165)
+        self._add_text_column("Velocidad", "speed_str", expand=False, min_width=105)
         self._add_text_column("Tiempo Restante", "eta_str", expand=False, min_width=125)
-        self._add_text_column("Estado", "status_str", expand=False, min_width=150)
+        self._add_text_column("Estado", "status_str", expand=False, min_width=145)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.add_css_class("table-area")
@@ -767,9 +1306,33 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         scrolled.set_hexpand(True)
         scrolled.set_child(self.column_view)
         self._scrolled = scrolled
-        root_box.append(scrolled)
+        table_card.append(scrolled)
 
-        # 3. Bottom Status Bar
+        table_card.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # Bottom Table Footer ("Seleccionar todo" + selection count)
+        table_footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        table_footer.add_css_class("table-footer")
+
+        self.chk_select_all = Gtk.CheckButton(label="Seleccionar todo")
+        self.chk_select_all.connect("toggled", self._on_select_all_toggled)
+        table_footer.append(self.chk_select_all)
+
+        tf_spacer = Gtk.Box()
+        tf_spacer.set_hexpand(True)
+        table_footer.append(tf_spacer)
+
+        self.lbl_selection_info = Gtk.Label(label="0 elementos")
+        self.lbl_selection_info.add_css_class("muted-label")
+        table_footer.append(self.lbl_selection_info)
+
+        table_card.append(table_footer)
+        right_panel.append(table_card)
+
+        body_split.append(right_panel)
+        root_box.append(body_split)
+
+        # 4. Bottom Status Bar
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         status_bar.add_css_class("status-bar")
 
@@ -807,10 +1370,65 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
 
         root_box.append(status_bar)
 
+    def _on_search_changed(self, entry: Gtk.SearchEntry) -> None:
+        self._search_query = entry.get_text().strip().lower()
+        self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self._update_selection_footer()
+
+    def _on_select_all_toggled(self, chk: Gtk.CheckButton) -> None:
+        if self._syncing_select_all:
+            return
+        if chk.get_active():
+            self.selection_model.select_all()
+        else:
+            self.selection_model.unselect_all()
+
+    def _on_table_selection_changed(self, *_args) -> None:
+        self._update_selection_footer()
+
+    def _update_selection_footer(self) -> None:
+        n_total = self.filter_list_model.get_n_items()
+        n_sel = self.selection_model.get_selection().get_size()
+
+        self._syncing_select_all = True
+        try:
+            self.chk_select_all.set_active(n_total > 0 and n_sel == n_total)
+            self.chk_select_all.set_inconsistent(0 < n_sel < n_total)
+        finally:
+            self._syncing_select_all = False
+
+        noun = "elemento" if n_total == 1 else "elementos"
+        if n_sel > 0:
+            sel_word = "seleccionado" if n_sel == 1 else "seleccionados"
+            self.lbl_selection_info.set_text(f"{n_total} {noun} • {n_sel} {sel_word}")
+        else:
+            self.lbl_selection_info.set_text(f"{n_total} {noun}")
+
     def _filter_row_by_container(self, row_obj: DownloadRowObject, _user_data) -> bool:
-        if not self._active_container_filter or self._active_container_filter == "Todos":
-            return True
-        return row_obj.container == self._active_container_filter
+        if self._active_container_filter and self._active_container_filter != "Todos":
+            if row_obj.container != self._active_container_filter:
+                return False
+
+        if self._active_status_filter == "unfinished":
+            if row_obj.status_raw == "complete":
+                return False
+        elif self._active_status_filter == "finished":
+            if row_obj.status_raw != "complete":
+                return False
+
+        if self._active_category_filter and self._active_category_filter != "all":
+            if row_obj.category != self._active_category_filter:
+                return False
+
+        if self._search_query:
+            haystack = (
+                f"{row_obj.filename} {row_obj.file_ext} {row_obj.origin} "
+                f"{row_obj.container} {row_obj.status_str}"
+            ).lower()
+            if self._search_query not in haystack:
+                return False
+
+        return True
 
     def _on_container_filter_changed(self, dropdown: Gtk.DropDown, _pspec) -> None:
         idx = dropdown.get_selected()
@@ -819,6 +1437,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         else:
             self._active_container_filter = "Todos"
         self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self._update_selection_footer()
 
     def _refresh_container_dropdown(self) -> None:
         containers = ["Todos"] + self.engine.get_containers()
@@ -843,6 +1462,68 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         elif os.path.isdir(self.engine.save_dir):
             open_path_with_system(self.engine.save_dir)
 
+    def _add_name_column(
+        self,
+        title: str,
+        expand: bool = True,
+        min_width: int = 230,
+    ) -> None:
+        factory = Gtk.SignalListItemFactory()
+
+        def _setup(_fac, list_item: Gtk.ListItem) -> None:
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            box.set_hexpand(True)
+            box.set_halign(Gtk.Align.FILL)
+            box.set_valign(Gtk.Align.CENTER)
+            box.set_margin_start(8)
+            box.set_margin_end(6)
+            box.set_margin_top(6)
+            box.set_margin_bottom(6)
+
+            ic = Gtk.Image.new_from_icon_name("text-x-generic-symbolic")
+            ic.set_pixel_size(16)
+            ic.set_valign(Gtk.Align.CENTER)
+
+            lbl = Gtk.Label(xalign=0.0)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            lbl.set_hexpand(True)
+            lbl.set_halign(Gtk.Align.FILL)
+            lbl.set_valign(Gtk.Align.CENTER)
+
+            box.append(ic)
+            box.append(lbl)
+            list_item.set_child(box)
+
+        def _bind(_fac, list_item: Gtk.ListItem) -> None:
+            row_obj: DownloadRowObject = list_item.get_item()
+            box = list_item.get_child()
+            if row_obj and isinstance(box, Gtk.Box):
+                ic = box.get_first_child()
+                lbl = ic.get_next_sibling() if ic else None
+                if isinstance(ic, Gtk.Image):
+                    ic.set_from_icon_name(row_obj.icon_name)
+                    self._item_widgets.setdefault(row_obj.item_id, {})["filename_icon"] = ic
+                if isinstance(lbl, Gtk.Label):
+                    lbl.set_text(row_obj.filename)
+                    lbl.set_tooltip_text(row_obj.filename)
+                    self._item_widgets.setdefault(row_obj.item_id, {})["filename"] = lbl
+
+        def _unbind(_fac, list_item: Gtk.ListItem) -> None:
+            row_obj: DownloadRowObject = list_item.get_item()
+            if row_obj and row_obj.item_id in self._item_widgets:
+                self._item_widgets[row_obj.item_id].pop("filename_icon", None)
+                self._item_widgets[row_obj.item_id].pop("filename", None)
+
+        factory.connect("setup", _setup)
+        factory.connect("bind", _bind)
+        factory.connect("unbind", _unbind)
+
+        col = Gtk.ColumnViewColumn.new(title, factory)
+        col.set_expand(expand)
+        col.set_resizable(True)
+        col.set_fixed_width(min_width)
+        self.column_view.append_column(col)
+
     def _add_text_column(
         self,
         title: str,
@@ -857,10 +1538,11 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             lbl.set_ellipsize(Pango.EllipsizeMode.END)
             lbl.set_hexpand(True)
             lbl.set_halign(Gtk.Align.FILL)
+            lbl.set_valign(Gtk.Align.CENTER)
             lbl.set_margin_start(6)
             lbl.set_margin_end(6)
-            lbl.set_margin_top(4)
-            lbl.set_margin_bottom(4)
+            lbl.set_margin_top(6)
+            lbl.set_margin_bottom(6)
             list_item.set_child(lbl)
 
         def _bind(_fac, list_item: Gtk.ListItem) -> None:
@@ -887,39 +1569,54 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         col.set_fixed_width(min_width)
         self.column_view.append_column(col)
 
-    def _add_progress_column(self, title: str, min_width: int = 170) -> None:
+    def _add_progress_column(self, title: str, min_width: int = 165) -> None:
         factory = Gtk.SignalListItemFactory()
 
         def _setup(_fac, list_item: Gtk.ListItem) -> None:
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            box.set_overflow(Gtk.Overflow.HIDDEN)
             box.set_hexpand(True)
             box.set_halign(Gtk.Align.FILL)
             box.set_valign(Gtk.Align.CENTER)
-            box.set_margin_start(6)
-            box.set_margin_end(6)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            box.set_margin_top(5)
+            box.set_margin_bottom(5)
+
+            pct_lbl = Gtk.Label(xalign=0.0)
+            pct_lbl.add_css_class("progress-pct-label")
+            pct_lbl.set_hexpand(True)
+            pct_lbl.set_halign(Gtk.Align.FILL)
 
             pbar = Gtk.ProgressBar()
-            pbar.set_show_text(True)
+            pbar.add_css_class("slim-progress")
+            pbar.set_show_text(False)
             pbar.set_hexpand(True)
             pbar.set_halign(Gtk.Align.FILL)
             pbar.set_valign(Gtk.Align.CENTER)
-            pbar.set_ellipsize(Pango.EllipsizeMode.END)
+
+            box.append(pct_lbl)
             box.append(pbar)
             list_item.set_child(box)
 
         def _bind(_fac, list_item: Gtk.ListItem) -> None:
             row_obj: DownloadRowObject = list_item.get_item()
             box = list_item.get_child()
-            pbar = box.get_first_child() if isinstance(box, Gtk.Box) else box
-            if row_obj and isinstance(pbar, Gtk.ProgressBar):
-                pbar.set_fraction(row_obj.progress_fraction)
-                pbar.set_text(row_obj.progress_text)
-                self._item_widgets.setdefault(row_obj.item_id, {})["progress"] = pbar
+            if row_obj and isinstance(box, Gtk.Box):
+                pct_lbl = box.get_first_child()
+                pbar = pct_lbl.get_next_sibling() if pct_lbl else None
+                if isinstance(pct_lbl, Gtk.Label):
+                    pct_lbl.set_text(row_obj.progress_text)
+                    self._item_widgets.setdefault(row_obj.item_id, {})["progress_label"] = pct_lbl
+                if isinstance(pbar, Gtk.ProgressBar):
+                    pbar.set_fraction(row_obj.progress_fraction)
+                    self._item_widgets.setdefault(row_obj.item_id, {})["progress_bar"] = pbar
 
         def _unbind(_fac, list_item: Gtk.ListItem) -> None:
             row_obj: DownloadRowObject = list_item.get_item()
             if row_obj and row_obj.item_id in self._item_widgets:
-                self._item_widgets[row_obj.item_id].pop("progress", None)
+                self._item_widgets[row_obj.item_id].pop("progress_label", None)
+                self._item_widgets[row_obj.item_id].pop("progress_bar", None)
 
         factory.connect("setup", _setup)
         factory.connect("bind", _bind)
@@ -980,48 +1677,113 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             row_obj = DownloadRowObject(item)
             self._row_map[item.id] = row_obj
             self.list_store.append(row_obj)
+        self._last_state_version = self.engine.state_version
+        self._refresh_container_dropdown()
+        self._update_selection_footer()
 
     def _on_ui_tick(self) -> bool:
-        current_ids = set(self.engine.items.keys())
-        known_ids = set(self._row_map.keys())
+        cur_ver = self.engine.state_version
+        if cur_ver != self._last_state_version:
+            self._last_state_version = cur_ver
+            engine_items = self.engine.items
+            list_mutated = False
+            containers_dirty = False
+            needs_refilter = False
 
-        for item_id in sorted(current_ids - known_ids):
-            item = self.engine.items.get(item_id)
-            if item:
-                row_obj = DownloadRowObject(item)
-                self._row_map[item_id] = row_obj
-                self.list_store.append(row_obj)
+            if engine_items.keys() != self._row_map.keys():
+                current_ids = set(engine_items.keys())
+                known_ids = set(self._row_map.keys())
+                for item_id in sorted(current_ids - known_ids):
+                    item = engine_items.get(item_id)
+                    if item:
+                        row_obj = DownloadRowObject(item)
+                        self._row_map[item_id] = row_obj
+                        self.list_store.append(row_obj)
+                        list_mutated = True
+                        containers_dirty = True
 
-        for item_id in known_ids - current_ids:
-            row_obj = self._row_map.pop(item_id, None)
-            self._item_widgets.pop(item_id, None)
-            if row_obj:
-                n = self.list_store.get_n_items()
-                for idx in range(n):
-                    if self.list_store.get_item(idx) == row_obj:
-                        self.list_store.remove(idx)
-                        break
+                removed_ids = known_ids - current_ids
+                if removed_ids:
+                    for item_id in removed_ids:
+                        self._row_map.pop(item_id, None)
+                        self._item_widgets.pop(item_id, None)
+                    for idx in range(self.list_store.get_n_items() - 1, -1, -1):
+                        ro = self.list_store.get_item(idx)
+                        if ro and ro.item_id in removed_ids:
+                            self.list_store.remove(idx)
+                    list_mutated = True
+                    containers_dirty = True
 
-        for item_id, row_obj in self._row_map.items():
-            item = self.engine.items.get(item_id)
-            if not item:
-                continue
-            if row_obj.sync_from_item(item):
-                widgets = self._item_widgets.get(item_id, {})
-                for attr in ("filename", "file_ext", "origin", "container", "host", "size_str", "speed_str", "eta_str", "status_str"):
-                    w = widgets.get(attr)
-                    if isinstance(w, Gtk.Label):
-                        val_str = str(getattr(row_obj, attr))
-                        w.set_text(val_str)
-                        w.set_tooltip_text(val_str)
-                pbar = widgets.get("progress")
-                if isinstance(pbar, Gtk.ProgressBar):
-                    pbar.set_fraction(row_obj.progress_fraction)
-                    pbar.set_text(row_obj.progress_text)
+            for item_id, row_obj in self._row_map.items():
+                item = engine_items.get(item_id)
+                if not item:
+                    continue
+                # Skip rows whose state is final and already synced unless metadata/container changed
+                prev_container = row_obj.container
+                prev_key = (
+                    row_obj.status_raw,
+                    row_obj.category,
+                    prev_container,
+                    row_obj.filename,
+                    row_obj.file_ext,
+                    row_obj.origin,
+                    row_obj.status_str,
+                )
+                if row_obj.sync_from_item(item):
+                    if row_obj.container != prev_container:
+                        containers_dirty = True
+                    if prev_key != (
+                        row_obj.status_raw,
+                        row_obj.category,
+                        row_obj.container,
+                        row_obj.filename,
+                        row_obj.file_ext,
+                        row_obj.origin,
+                        row_obj.status_str,
+                    ):
+                        needs_refilter = True
 
-        self._refresh_container_dropdown()
-        self.lbl_total_speed.set_text(f"Velocidad Total: {format_speed_mbs(self.runner.total_speed_bps)}")
-        self.lbl_active.set_text(f"Descargas activas: {self.runner.active_count} / {self.engine.max_concurrent}")
+                    widgets = self._item_widgets.get(item_id)
+                    if widgets:
+                        ic = widgets.get("filename_icon")
+                        if isinstance(ic, Gtk.Image):
+                            ic.set_from_icon_name(row_obj.icon_name)
+                        for attr in ("filename", "file_ext", "origin", "size_str", "speed_str", "eta_str", "status_str"):
+                            w = widgets.get(attr)
+                            if isinstance(w, Gtk.Label):
+                                val_str = str(getattr(row_obj, attr))
+                                w.set_text(val_str)
+                                w.set_tooltip_text(val_str)
+                        pct_lbl = widgets.get("progress_label")
+                        if isinstance(pct_lbl, Gtk.Label):
+                            pct_lbl.set_text(row_obj.progress_text)
+                        pbar = widgets.get("progress_bar")
+                        if isinstance(pbar, Gtk.ProgressBar):
+                            pbar.set_fraction(row_obj.progress_fraction)
+
+            if containers_dirty:
+                self._refresh_container_dropdown()
+
+            has_active_filter = (
+                self._active_container_filter != "Todos"
+                or self._active_status_filter != "all"
+                or self._active_category_filter != "all"
+                or bool(self._search_query)
+            )
+            if needs_refilter and has_active_filter:
+                self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+                list_mutated = True
+            if list_mutated:
+                self._update_selection_footer()
+
+        stats_key = (self.runner.total_speed_bps, self.runner.active_count, self.engine.max_concurrent)
+        if stats_key != self._last_stats:
+            prev_spd, prev_act, prev_max = self._last_stats
+            self._last_stats = stats_key
+            if stats_key[0] != prev_spd:
+                self.lbl_total_speed.set_text(f"Velocidad Total: {format_speed_mbs(stats_key[0])}")
+            if stats_key[1] != prev_act or stats_key[2] != prev_max:
+                self.lbl_active.set_text(f"Descargas activas: {stats_key[1]} / {stats_key[2]}")
 
         # JDownloader-style Clipboard Watcher: every ~1.5s, if the user copied a direct
         # download*.mediafire.com URL while there are waiting MediaFire tasks, auto-bind it!
@@ -1037,7 +1799,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
                 def _on_clip_watch(cb, res) -> None:
                     try:
                         txt = cb.read_text_finish(res)
-                        if not txt:
+                        if not txt or "mediafire.com" not in txt:
                             return
                         for u in URL_EXTRACT_RE.findall(txt):
                             if "download" in u and "mediafire.com" in u and u not in self._seen_clipboard_links:
@@ -1109,21 +1871,37 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         dialog.connect("response", _on_response)
         dialog.present()
 
-    def _on_add_links_clicked(self, _btn: Gtk.Button) -> None:
+    def _create_modal_window(
+        self,
+        title: str,
+        width: int,
+        height: int,
+        spacing: int = 12,
+        margin: int = 14,
+    ) -> tuple[Gtk.Window, Gtk.Box]:
         dialog = Gtk.Window(
-            title="Agregar enlaces (Directos, YouTube, Cloud, Magnet / Torrent)",
+            title=title,
             transient_for=self,
             modal=True,
-            default_width=690,
-            default_height=430,
+            default_width=width,
+            default_height=height,
         )
-
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        vbox.set_margin_top(14)
-        vbox.set_margin_bottom(14)
-        vbox.set_margin_start(14)
-        vbox.set_margin_end(14)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
+        vbox.set_margin_top(margin)
+        vbox.set_margin_bottom(margin)
+        vbox.set_margin_start(margin)
+        vbox.set_margin_end(margin)
         dialog.set_child(vbox)
+        return dialog, vbox
+
+    def _on_add_links_clicked(self, _btn: Gtk.Button) -> None:
+        dialog, vbox = self._create_modal_window(
+            "Agregar enlaces (Directos, YouTube, Nube, Enlace magnético / Torrent)",
+            690,
+            430,
+            spacing=10,
+            margin=14,
+        )
 
         info_lbl = Gtk.Label(
             label=(
@@ -1148,7 +1926,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
 
         # Video metadata & dynamic resolution selector
         yt_status_lbl = Gtk.Label(
-            label="Tip: Si pegas un enlace de YouTube, se consultarán automáticamente todas sus resoluciones.",
+            label="Consejo: Si pegas un enlace de YouTube, se consultarán automáticamente todas sus resoluciones.",
             xalign=0.0,
         )
         yt_status_lbl.set_ellipsize(Pango.EllipsizeMode.END)
@@ -1156,7 +1934,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
 
         quality_ids: List[str] = ["best", "2160p", "1440p", "1080p", "720p", "480p", "360p", "audio"]
         quality_labels: List[str] = [
-            "Máxima calidad (best)",
+            "Máxima calidad (automática)",
             "2160p 4K UHD (MP4)",
             "1440p 2K QHD (MP4)",
             "1080p Full HD (MP4)",
@@ -1349,19 +2127,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
 
     def _on_assign_container_clicked(self, _btn: Gtk.Button) -> None:
         sel = self._get_selected_item_ids()
-        dialog = Gtk.Window(
-            title="Asignar a Contenedor",
-            transient_for=self,
-            modal=True,
-            default_width=440,
-            default_height=180,
-        )
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_margin_top(14)
-        vbox.set_margin_bottom(14)
-        vbox.set_margin_start(14)
-        vbox.set_margin_end(14)
-        dialog.set_child(vbox)
+        dialog, vbox = self._create_modal_window("Asignar a Contenedor", 440, 180)
 
         target_desc = (
             f"{len(sel)} enlace(s) seleccionado(s)"
@@ -1441,19 +2207,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         if not sel:
             return
 
-        dialog = Gtk.Window(
-            title="Eliminar descargas",
-            transient_for=self,
-            modal=True,
-            default_width=420,
-            default_height=160,
-        )
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_margin_top(14)
-        vbox.set_margin_bottom(14)
-        vbox.set_margin_start(14)
-        vbox.set_margin_end(14)
-        dialog.set_child(vbox)
+        dialog, vbox = self._create_modal_window("Eliminar descargas", 420, 160)
 
         lbl = Gtk.Label(
             label=f"¿Deseas eliminar {len(sel)} enlace(s) seleccionado(s) de la cola?",
@@ -1521,19 +2275,13 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         dialog.present()
 
     def _on_theme_clicked(self, _btn: Gtk.Button) -> None:
-        dialog = Gtk.Window(
-            title="Personalizar fondo de Mint Downloader",
-            transient_for=self,
-            modal=True,
-            default_width=500,
-            default_height=340,
+        dialog, vbox = self._create_modal_window(
+            "Personalizar fondo de Mint Downloader",
+            500,
+            340,
+            spacing=12,
+            margin=16,
         )
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_margin_top(16)
-        vbox.set_margin_bottom(16)
-        vbox.set_margin_start(16)
-        vbox.set_margin_end(16)
-        dialog.set_child(vbox)
 
         lbl_intro = Gtk.Label(
             label="Elige el fondo para la ventana principal:",
@@ -1542,7 +2290,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         vbox.append(lbl_intro)
 
         # Mode selector buttons
-        chk_default = Gtk.CheckButton(label="Tema predeterminado del sistema")
+        chk_default = Gtk.CheckButton(label="Tema oscuro predeterminado de Mint Downloader")
         chk_color = Gtk.CheckButton(label="Color sólido personalizado", group=chk_default)
         chk_image = Gtk.CheckButton(label="Imagen de fondo personalizada", group=chk_default)
 
@@ -1589,19 +2337,20 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
             ("#3b0764", "Púrpura"),
             ("#f1f5f9", "Claro"),
         ]
-        sw_css = []
-        for idx, (hex_col, _tip) in enumerate(swatches):
-            sw_css.append(
+        if not self._swatch_css_loaded:
+            sw_css = [
                 f".bg-swatch-{idx} {{ background-color: {hex_col}; background-image: none; min-width: 24px; min-height: 24px; border-radius: 6px; padding: 0; }}"
-            )
-        sw_prov = Gtk.CssProvider()
-        sw_prov.load_from_data("\n".join(sw_css).encode("utf-8"))
-        if Gdk.Display.get_default():
-            Gtk.StyleContext.add_provider_for_display(
-                Gdk.Display.get_default(),
-                sw_prov,
-                Gtk.STYLE_PROVIDER_PRIORITY_USER,
-            )
+                for idx, (hex_col, _tip) in enumerate(swatches)
+            ]
+            sw_prov = Gtk.CssProvider()
+            sw_prov.load_from_data("\n".join(sw_css).encode("utf-8"))
+            if Gdk.Display.get_default():
+                Gtk.StyleContext.add_provider_for_display(
+                    Gdk.Display.get_default(),
+                    sw_prov,
+                    Gtk.STYLE_PROVIDER_PRIORITY_USER,
+                )
+            self._swatch_css_loaded = True
 
         for idx, (hex_col, tip) in enumerate(swatches):
             sw_btn = Gtk.Button()

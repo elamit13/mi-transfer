@@ -11,6 +11,7 @@ Resolves direct download links, headers, filenames, and encryption keys for:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import glob
 import html
@@ -21,7 +22,9 @@ import shutil
 import sqlite3
 import struct
 import tempfile
+import threading
 import urllib.parse
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -41,6 +44,41 @@ DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
+
+# Pre-compiled regular expressions for URL parsing & HTML metadata extraction
+_SANITIZE_RE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+_CD_UTF8_RE = re.compile(r"filename\*\s*=\s*UTF-8''([^;\r\n]+)", re.I)
+_CD_QUOTED_RE = re.compile(r'filename\s*=\s*"([^"]+)"', re.I)
+_CD_PLAIN_RE = re.compile(r"filename\s*=\s*([^;\r\n]+)", re.I)
+_MEGA_FILE_RE = re.compile(r"mega\.(?:co\.)?nz/file/([a-zA-Z0-9_-]+)#([a-zA-Z0-9_-]+)")
+_MEGA_LEGACY_RE = re.compile(r"mega\.(?:co\.)?nz/#!([a-zA-Z0-9_-]+)!([a-zA-Z0-9_-]+)")
+_MF_DL_URL_RE = re.compile(r"https?://download[0-9]*\.mediafire\.com/", re.I)
+_MF_DL_QK_RE = re.compile(r"download[0-9]*\.mediafire\.com/[^/]+/([a-zA-Z0-9]+)/")
+_MF_PAGE_QK_RE = re.compile(r"mediafire\.com/(?:file|file_premium|download)/([a-zA-Z0-9]+)")
+_MF_PARAM_QK_RE = re.compile(r"[?&]quickkey=([a-zA-Z0-9]+)")
+_MF_FOLDER_KEY_RE = re.compile(r"/folder/([a-zA-Z0-9,_-]+)")
+_MF_FOLDER_FRAG_RE = re.compile(r"[a-zA-Z0-9_-]{10,}")
+_MF_SCRAMBLED_RE = re.compile(r'data-scrambled-url=["\']([^"\']+)["\']')
+_MF_BTN_RE = re.compile(r'id=["\']downloadButton["\'][^>]*href=["\'](https?://[^"\']+)["\']', re.I)
+_MF_INLINE_DL_RE = re.compile(r"(https?://download[0-9]*\.mediafire\.com/[^\s\"'<>]+)")
+_GDRIVE_ID_PATTERNS = (
+    re.compile(r"/file/d/([a-zA-Z0-9_-]{10,})"),
+    re.compile(r"[?&]id=([a-zA-Z0-9_-]{10,})"),
+    re.compile(r"/d/([a-zA-Z0-9_-]{10,})"),
+)
+_GDRIVE_FORM_RE = re.compile(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"')
+_GDRIVE_INPUT_RE = re.compile(r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"')
+_GDRIVE_NAME_RE = re.compile(r'class="uc-name-size"[^>]*>\s*<a[^>]*>([^<]+)</a>')
+_1FICHIER_WAIT_RE = re.compile(r"You must wait\s+([^.<]+)")
+_1FICHIER_NAME_RE = re.compile(r">File Name\s*:\s*</td>\s*<td[^>]*>([^<]+)</td>", re.I)
+_1FICHIER_ADZ_RE = re.compile(r'name="adz"\s+value="([^"]+)"')
+_1FICHIER_LINK_RE = re.compile(r'<a[^>]+href=["\'](https?://[a-zA-Z0-9.-]+\.1fichier\.com/[^"\']+)["\']')
+_MAGNET_BTIH_RE = re.compile(r"xt=urn:btih:([a-zA-Z0-9]+)", re.I)
+_FF_VER_RE = re.compile(r"LastVersion=([0-9]+\.[0-9]+)")
+
+# Cache for Firefox SQLite snapshots keyed by (db_path, cache_key) -> ((mtime_ns, wal_mtime_ns), value)
+_FF_SQLITE_CACHE: Dict[tuple[str, str], tuple[tuple[int, int], Any]] = {}
+_FF_CACHE_LOCK = threading.Lock()
 
 
 class ExtractorError(Exception):
@@ -86,13 +124,18 @@ class ResolvedDownload:
 
 def detect_host(url: str) -> str:
     """Return a clean human-readable host/provider name for a URL."""
+    u_low = url.lower()
+    if u_low.startswith("magnet:?"):
+        return "BitTorrent (Enlace magnético)"
+    if u_low.endswith(".torrent") and (u_low.startswith("/") or "://" in u_low):
+        return "BitTorrent (.torrent)"
+
     try:
-        parsed = urllib.parse.urlparse(url)
-        netloc = (parsed.netloc or "").lower()
+        netloc = (urllib.parse.urlparse(url).netloc or "").lower()
     except Exception:
         netloc = ""
 
-    if any(k in netloc for k in ("mega.nz", "mega.co.nz")):
+    if "mega.nz" in netloc or "mega.co.nz" in netloc:
         return "MEGA"
     if "mediafire.com" in netloc:
         return "MediaFire"
@@ -102,38 +145,45 @@ def detect_host(url: str) -> str:
         return "OneDrive"
     if "1fichier.com" in netloc:
         return "1fichier"
-    if url.lower().startswith("magnet:?"):
-        return "BitTorrent (Magnet)"
-    if url.lower().endswith(".torrent") or (url.startswith("/") and url.lower().endswith(".torrent")):
-        return "BitTorrent (.torrent)"
-    if any(k in netloc for k in ("youtube.com", "youtu.be")):
+    if "youtube.com" in netloc or "youtu.be" in netloc:
         return "YouTube"
     if any(k in netloc for k in ("twitch.tv", "vimeo.com", "dailymotion.com", "tiktok.com", "twitter.com", "x.com")):
-        return netloc.replace("www.", "")
-    if ".m3u8" in url.lower():
-        return "HLS Stream"
-    return netloc.replace("www.", "") or "Directo"
+        return netloc.removeprefix("www.")
+    if ".m3u8" in u_low:
+        return "Transmisión HLS"
+    return netloc.removeprefix("www.") or "Directo"
 
 
 def _sanitize_filename(name: str) -> str:
     name = urllib.parse.unquote(name).strip()
-    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name)
+    name = _SANITIZE_RE.sub("_", name)
     return name or "download.bin"
 
 
 def _extract_filename_from_cd(content_disposition: str) -> Optional[str]:
     if not content_disposition:
         return None
-    m = re.search(r"filename\*\s*=\s*UTF-8''([^;\r\n]+)", content_disposition, re.I)
+    m = _CD_UTF8_RE.search(content_disposition)
     if m:
         return _sanitize_filename(urllib.parse.unquote(m.group(1).strip(' "\'')))
-    m = re.search(r'filename\s*=\s*"([^"]+)"', content_disposition, re.I)
+    m = _CD_QUOTED_RE.search(content_disposition)
     if m:
         return _sanitize_filename(m.group(1))
-    m = re.search(r"filename\s*=\s*([^;\r\n]+)", content_disposition, re.I)
+    m = _CD_PLAIN_RE.search(content_disposition)
     if m:
         return _sanitize_filename(m.group(1).strip(' "\''))
     return None
+
+
+def _raise_for_http_status(status: int, url: str) -> None:
+    if status == 404:
+        raise DeadLinkError(f"Enlace caído (HTTP 404): {url}")
+    if status in (401, 403):
+        raise ProtectedFileError(f"Acceso denegado o protegido (HTTP {status}): {url}")
+    if status == 429:
+        raise BandwidthLimitError(f"Límite de ancho de banda / peticiones (HTTP 429): {url}")
+    if status >= 400:
+        raise ExtractorError(f"Error HTTP {status} al verificar enlace: {url}")
 
 
 def _mega_base64_decode(data: str) -> bytes:
@@ -168,10 +218,10 @@ def _mega_cbc_decrypt(data: bytes, key_bytes: bytes) -> bytes:
 
 def parse_mega_url(url: str) -> tuple[str, str]:
     """Extract (file_id, file_key_b64) from modern or legacy MEGA URLs."""
-    m = re.search(r"mega\.(?:co\.)?nz/file/([a-zA-Z0-9_-]+)#([a-zA-Z0-9_-]+)", url)
+    m = _MEGA_FILE_RE.search(url)
     if m:
         return m.group(1), m.group(2)
-    m = re.search(r"mega\.(?:co\.)?nz/#!([a-zA-Z0-9_-]+)!([a-zA-Z0-9_-]+)", url)
+    m = _MEGA_LEGACY_RE.search(url)
     if m:
         return m.group(1), m.group(2)
     if "mega.nz/folder/" in url or "mega.nz/#F!" in url:
@@ -264,13 +314,13 @@ class CloudExtractor:
     @staticmethod
     def extract_mediafire_quickkey(url: str) -> str:
         """Extract the MediaFire quickkey from either a /file/<qk>/... or download*.mediafire.com/.../<qk>/... URL."""
-        m_dl = re.search(r"download[0-9]*\.mediafire\.com/[^/]+/([a-zA-Z0-9]+)/", url)
+        m_dl = _MF_DL_QK_RE.search(url)
         if m_dl:
             return m_dl.group(1)
-        m_qk = re.search(r"mediafire\.com/(?:file|file_premium|download)/([a-zA-Z0-9]+)", url)
+        m_qk = _MF_PAGE_QK_RE.search(url)
         if m_qk:
             return m_qk.group(1)
-        m_param = re.search(r"[?&]quickkey=([a-zA-Z0-9]+)", url)
+        m_param = _MF_PARAM_QK_RE.search(url)
         if m_param:
             return m_param.group(1)
         return ""
@@ -306,53 +356,98 @@ class CloudExtractor:
             return False, "", None, 0
 
     @staticmethod
-    def find_browser_resolved_mediafire_links(quickkey: Optional[str] = None) -> Dict[str, str]:
+    def _query_firefox_sqlite(
+        db_filename: str,
+        cache_tag: str,
+        query_fn: Callable[[sqlite3.Connection], Any],
+        default_val: Any,
+    ) -> list[Any]:
         """
-        Read-only lookup in local Firefox profile history (places.sqlite) for recently
-        resolved `https://download*.mediafire.com/.../<quickkey>/...` direct links
-        that the user already opened in their browser.
-        Returns a mapping of {quickkey: direct_download_url}.
+        Safely query local Firefox SQLite databases using mtime/WAL validation caching so
+        unchanged databases incur zero disk copies or SQLite reads.
         """
-        found: Dict[str, str] = {}
         ff_root = os.path.expanduser("~/.mozilla/firefox")
         if not os.path.isdir(ff_root):
-            return found
+            return []
 
-        for places_path in glob.glob(os.path.join(ff_root, "*.default*", "places.sqlite")):
-            tmp_fd, tmp_path = tempfile.mkstemp(prefix="mintdl_places_", suffix=".sqlite")
-            os.close(tmp_fd)
+        results: list[Any] = []
+        for db_path in glob.glob(os.path.join(ff_root, "*.default*", db_filename)):
             try:
-                shutil.copy2(places_path, tmp_path)
+                db_mtime = os.stat(db_path).st_mtime_ns
+            except OSError:
+                continue
+            try:
+                wal_mtime = os.stat(db_path + "-wal").st_mtime_ns
+            except OSError:
+                wal_mtime = 0
+            sig = (db_mtime, wal_mtime)
+            ckey = (db_path, cache_tag)
+
+            with _FF_CACHE_LOCK:
+                cached = _FF_SQLITE_CACHE.get(ckey)
+                if cached and cached[0] == sig:
+                    results.append(cached[1])
+                    continue
+
+            tmp_fd, tmp_path = tempfile.mkstemp(prefix="mintdl_ff_", suffix=".sqlite")
+            os.close(tmp_fd)
+            val = default_val
+            try:
+                shutil.copy2(db_path, tmp_path)
                 for wal_ext in ("-wal", "-shm"):
-                    if os.path.exists(places_path + wal_ext):
-                        shutil.copy2(places_path + wal_ext, tmp_path + wal_ext)
+                    src_wal = db_path + wal_ext
+                    if os.path.exists(src_wal):
+                        shutil.copy2(src_wal, tmp_path + wal_ext)
                 with sqlite3.connect(tmp_path) as conn:
-                    if quickkey:
-                        rows = conn.execute(
-                            "SELECT url FROM moz_places "
-                            "WHERE url LIKE 'https://download%.mediafire.com/%/' || ? || '/%' "
-                            "ORDER BY last_visit_date DESC LIMIT 5",
-                            (quickkey,),
-                        ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            "SELECT url FROM moz_places "
-                            "WHERE url LIKE 'https://download%.mediafire.com/%' "
-                            "ORDER BY last_visit_date DESC LIMIT 100"
-                        ).fetchall()
-                    for (u,) in rows:
-                        qk = CloudExtractor.extract_mediafire_quickkey(u)
-                        if qk and qk not in found:
-                            found[qk] = u
+                    val = query_fn(conn)
+                with _FF_CACHE_LOCK:
+                    _FF_SQLITE_CACHE[ckey] = (sig, val)
             except Exception:
                 pass
             finally:
                 for ext in ("", "-wal", "-shm"):
                     try:
-                        if os.path.exists(tmp_path + ext):
-                            os.remove(tmp_path + ext)
+                        os.remove(tmp_path + ext)
                     except OSError:
                         pass
+            results.append(val)
+        return results
+
+    @staticmethod
+    def find_browser_resolved_mediafire_links(quickkey: Optional[str] = None) -> Dict[str, str]:
+        """
+        Read-only lookup in local Firefox profile history (places.sqlite) for recently
+        resolved `https://download*.mediafire.com/.../<quickkey>/...` direct links.
+        Returns a mapping of {quickkey: direct_download_url}.
+        """
+        found: Dict[str, str] = {}
+        tag = f"places:{quickkey or '*'}"
+
+        def _run_q(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+            if quickkey:
+                rows = conn.execute(
+                    "SELECT url FROM moz_places "
+                    "WHERE url LIKE 'https://download%.mediafire.com/%/' || ? || '/%' "
+                    "ORDER BY last_visit_date DESC LIMIT 5",
+                    (quickkey,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT url FROM moz_places "
+                    "WHERE url LIKE 'https://download%.mediafire.com/%' "
+                    "ORDER BY last_visit_date DESC LIMIT 100"
+                ).fetchall()
+            out: list[tuple[str, str]] = []
+            for (u,) in rows:
+                qk = CloudExtractor.extract_mediafire_quickkey(u)
+                if qk:
+                    out.append((qk, u))
+            return out
+
+        for pairs in CloudExtractor._query_firefox_sqlite("places.sqlite", tag, _run_q, []):
+            for qk, u in pairs:
+                if qk not in found:
+                    found[qk] = u
         return found
 
     @staticmethod
@@ -370,7 +465,7 @@ class CloudExtractor:
         for compat_path in glob.glob(os.path.join(ff_root, "*.default*", "compatibility.ini")):
             try:
                 with open(compat_path, "r", encoding="utf-8", errors="ignore") as f:
-                    m_ver = re.search(r"LastVersion=([0-9]+\.[0-9]+)", f.read())
+                    m_ver = _FF_VER_RE.search(f.read())
                     if m_ver:
                         ver = m_ver.group(1)
                         ua = f"Mozilla/5.0 (X11; Linux x86_64; rv:{ver}) Gecko/20100101 Firefox/{ver}"
@@ -378,51 +473,46 @@ class CloudExtractor:
             except Exception:
                 pass
 
-        for cookie_db in glob.glob(os.path.join(ff_root, "*.default*", "cookies.sqlite")):
-            tmp_fd, tmp_path = tempfile.mkstemp(prefix="mintdl_cookies_", suffix=".sqlite")
-            os.close(tmp_fd)
-            try:
-                shutil.copy2(cookie_db, tmp_path)
-                for wal_ext in ("-wal", "-shm"):
-                    if os.path.exists(cookie_db + wal_ext):
-                        shutil.copy2(cookie_db + wal_ext, tmp_path + wal_ext)
-                with sqlite3.connect(tmp_path) as conn:
-                    for name, val in conn.execute(
-                        "SELECT name, value FROM moz_cookies WHERE host LIKE '%mediafire.com%'"
-                    ):
-                        if name and val:
-                            cookies[name] = val
-            except Exception:
-                pass
-            finally:
-                for ext in ("", "-wal", "-shm"):
-                    try:
-                        if os.path.exists(tmp_path + ext):
-                            os.remove(tmp_path + ext)
-                    except OSError:
-                        pass
+        def _run_cookies(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+            return [
+                (name, val)
+                for name, val in conn.execute(
+                    "SELECT name, value FROM moz_cookies WHERE host LIKE '%mediafire.com%'"
+                )
+                if name and val
+            ]
+
+        for pairs in CloudExtractor._query_firefox_sqlite("cookies.sqlite", "mf_cookies", _run_cookies, []):
+            for name, val in pairs:
+                cookies[name] = val
         return cookies, ua
 
     def is_folder_url(self, url: str) -> bool:
         """Return True if the URL points to a multi-file cloud folder."""
-        parsed = urllib.parse.urlparse(url)
-        netloc = (parsed.netloc or "").lower()
-        path = (parsed.path or "").lower()
-        if "mediafire.com" in netloc and ("/folder/" in path or "folderkey=" in url.lower()):
-            return True
-        return False
+        u_low = url.lower()
+        if "mediafire.com" not in u_low:
+            return False
+        parsed = urllib.parse.urlparse(u_low)
+        return "mediafire.com" in parsed.netloc and ("/folder/" in parsed.path or "folderkey=" in u_low)
 
-    async def expand_folder(self, url: str) -> list[FolderEntry]:
+    async def expand_folder(
+        self,
+        url: str,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> list[FolderEntry]:
         """
         Expand a cloud folder URL (such as MediaFire /folder/<key>/#<subkey>)
         recursively into a list of individual file entries with relative subfolder paths.
         """
-        host = detect_host(url)
-        if host == "MediaFire" and self.is_folder_url(url):
-            return await self._expand_mediafire_folder(url)
+        if detect_host(url) == "MediaFire" and self.is_folder_url(url):
+            return await self._expand_mediafire_folder(url, session=session)
         return []
 
-    async def _expand_mediafire_folder(self, url: str) -> list[FolderEntry]:
+    async def _expand_mediafire_folder(
+        self,
+        url: str,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> list[FolderEntry]:
         """
         Resolve MediaFire folder contents via the public MediaFire REST API v1.5.
         If the URL contains a hash fragment (#subfolder_key), prioritizes that specific
@@ -430,20 +520,21 @@ class CloudExtractor:
         """
         parsed = urllib.parse.urlparse(url)
         frag = (parsed.fragment or "").strip().strip("/")
-        m_path = re.search(r"/folder/([a-zA-Z0-9,_-]+)", parsed.path)
+        m_path = _MF_FOLDER_KEY_RE.search(parsed.path)
         path_key = m_path.group(1).split(",")[0] if m_path else ""
 
-        root_key = frag if (frag and re.fullmatch(r"[a-zA-Z0-9_-]{10,}", frag)) else path_key
+        root_key = frag if (frag and _MF_FOLDER_FRAG_RE.fullmatch(frag)) else path_key
         if not root_key:
             raise ExtractorError("No se pudo extraer el identificador de carpeta (folder_key) de MediaFire.")
 
         headers = {"User-Agent": DEFAULT_UA}
         entries: list[FolderEntry] = []
 
-        async with aiohttp.ClientSession(timeout=self.timeout, headers=headers) as session:
-            root_name = await self._fetch_mediafire_folder_name(session, root_key)
+        ctx = nullcontext(session) if session else aiohttp.ClientSession(timeout=self.timeout, headers=headers)
+        async with ctx as active_sess:
+            root_name = await self._fetch_mediafire_folder_name(active_sess, root_key)
             await self._walk_mediafire_folder(
-                session=session,
+                session=active_sess,
                 folder_key=root_key,
                 rel_dir=_sanitize_filename(root_name) if root_name else "",
                 out=entries,
@@ -527,29 +618,39 @@ class CloudExtractor:
                 next_rel = os.path.join(rel_dir, sf_name) if rel_dir else sf_name
                 await self._walk_mediafire_folder(session, sf_key, next_rel, out, depth + 1)
 
-    async def resolve(self, url: str) -> ResolvedDownload:
+    async def resolve(
+        self,
+        url: str,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> ResolvedDownload:
         host = detect_host(url)
         if host == "MEGA":
-            return await self._resolve_mega(url)
+            return await self._resolve_mega(url, session=session)
         if host == "MediaFire":
-            return await self._resolve_mediafire(url)
+            return await self._resolve_mediafire(url, session=session)
         if host == "Google Drive":
             return await self._resolve_gdrive(url)
         if host == "OneDrive":
-            return await self._resolve_onedrive(url)
+            return await self._resolve_onedrive(url, session=session)
         if host == "1fichier":
             return await self._resolve_1fichier(url)
-        return await self._resolve_direct(url, host)
+        return await self._resolve_direct(url, host, session=session)
 
-    async def _resolve_mega(self, url: str) -> ResolvedDownload:
+    async def _resolve_mega(
+        self,
+        url: str,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> ResolvedDownload:
         file_id, file_key = parse_mega_url(url)
         aes_key, ctr_iv = unpack_mega_key(file_key)
 
         api_url = "https://g.api.mega.co.nz/cs?id=1"
         payload = [{"a": "g", "g": 1, "p": file_id}]
+        req_headers = {"User-Agent": DEFAULT_UA}
 
-        async with aiohttp.ClientSession(timeout=self.timeout, headers={"User-Agent": DEFAULT_UA}) as session:
-            async with session.post(api_url, json=payload) as resp:
+        ctx = nullcontext(session) if session else aiohttp.ClientSession(timeout=self.timeout, headers=req_headers)
+        async with ctx as active_sess:
+            async with active_sess.post(api_url, json=payload, headers=req_headers) as resp:
                 if resp.status >= 400:
                     raise ExtractorError(f"MEGA API devolvió HTTP {resp.status}")
                 data = await resp.json(content_type=None)
@@ -588,7 +689,7 @@ class CloudExtractor:
             filename=filename,
             host="MEGA",
             size=size,
-            headers={"User-Agent": DEFAULT_UA},
+            headers=req_headers,
             extractor_type="mega",
             extra={
                 "mega_key_hex": aes_key.hex(),
@@ -597,8 +698,12 @@ class CloudExtractor:
             },
         )
 
-    async def _resolve_mediafire(self, url: str) -> ResolvedDownload:
-        browser_cookies, browser_ua = self.load_browser_mediafire_cookies()
+    async def _resolve_mediafire(
+        self,
+        url: str,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> ResolvedDownload:
+        browser_cookies, browser_ua = await asyncio.to_thread(self.load_browser_mediafire_cookies)
         headers: Dict[str, str] = {
             "User-Agent": browser_ua or DEFAULT_UA,
             "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
@@ -606,13 +711,14 @@ class CloudExtractor:
         if browser_cookies:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in browser_cookies.items())
 
-        # If the user already passed a direct download*.mediafire.com URL
-        if re.search(r"https?://download[0-9]*\.mediafire\.com/", url, re.I):
-            fname = _sanitize_filename(os.path.basename(urllib.parse.urlparse(url).path))
-            size = 0
-            async with aiohttp.ClientSession(timeout=self.timeout, headers={"User-Agent": DEFAULT_UA}) as session:
+        ctx = nullcontext(session) if session else aiohttp.ClientSession(timeout=self.timeout, headers={"User-Agent": DEFAULT_UA})
+        async with ctx as active_sess:
+            # If the user already passed a direct download*.mediafire.com URL
+            if _MF_DL_URL_RE.search(url):
+                fname = _sanitize_filename(os.path.basename(urllib.parse.urlparse(url).path))
+                size = 0
                 try:
-                    async with session.head(url, allow_redirects=True) as hresp:
+                    async with active_sess.head(url, headers={"User-Agent": DEFAULT_UA}, allow_redirects=True) as hresp:
                         if hresp.status >= 400:
                             raise DeadLinkError("El enlace directo de MediaFire expiró o no es válido.")
                         cd_name = _extract_filename_from_cd(hresp.headers.get("Content-Disposition", ""))
@@ -623,28 +729,27 @@ class CloudExtractor:
                     raise
                 except Exception:
                     pass
-            return ResolvedDownload(
-                original_url=url,
-                direct_url=url,
-                filename=fname,
-                host="MediaFire",
-                size=size,
-                headers={"User-Agent": DEFAULT_UA},
-                extractor_type="mediafire",
-            )
+                return ResolvedDownload(
+                    original_url=url,
+                    direct_url=url,
+                    filename=fname,
+                    host="MediaFire",
+                    size=size,
+                    headers={"User-Agent": DEFAULT_UA},
+                    extractor_type="mediafire",
+                )
 
-        quickkey = self.extract_mediafire_quickkey(url)
+            quickkey = self.extract_mediafire_quickkey(url)
+            api_filename = ""
+            api_size = 0
 
-        api_filename = ""
-        api_size = 0
-        async with aiohttp.ClientSession(timeout=self.timeout, headers=headers) as session:
             if quickkey:
                 try:
                     info_api = (
                         f"https://www.mediafire.com/api/1.5/file/get_info.php"
                         f"?quick_key={quickkey}&response_format=json"
                     )
-                    async with session.get(info_api) as iresp:
+                    async with active_sess.get(info_api, headers=headers) as iresp:
                         idata = await iresp.json(content_type=None)
                         finfo = idata.get("response", {}).get("file_info") or {}
                         if finfo:
@@ -654,11 +759,11 @@ class CloudExtractor:
                     pass
 
                 # 1. Check if the user's browser already resolved a valid direct link for this quickkey
-                browser_links = self.find_browser_resolved_mediafire_links(quickkey)
+                browser_links = await asyncio.to_thread(self.find_browser_resolved_mediafire_links, quickkey)
                 candidate_dl = browser_links.get(quickkey)
                 if candidate_dl:
                     is_valid, real_url, cd_name, real_size = await self.verify_mediafire_direct_link(
-                        session, candidate_dl, expected_size=api_size
+                        active_sess, candidate_dl, expected_size=api_size
                     )
                     if is_valid:
                         fname = cd_name or api_filename or _sanitize_filename(
@@ -681,7 +786,7 @@ class CloudExtractor:
                         f"https://www.mediafire.com/api/1.5/file/get_links.php"
                         f"?quick_key={quickkey}&link_type=direct_download&response_format=json"
                     )
-                    async with session.get(links_api) as lresp:
+                    async with active_sess.get(links_api, headers=headers) as lresp:
                         ldata = await lresp.json(content_type=None)
                         links_list = ldata.get("response", {}).get("links") or []
                         if links_list and links_list[0].get("direct_download"):
@@ -701,7 +806,7 @@ class CloudExtractor:
 
             # 3. Fetch web page using clean URL without ?action=check first
             clean_url = url.split("?")[0] if "action=check" in url else url
-            async with session.get(clean_url, allow_redirects=True) as resp:
+            async with active_sess.get(clean_url, headers=headers, allow_redirects=True) as resp:
                 if resp.status == 404 or "error.php" in str(resp.url):
                     raise DeadLinkError("El archivo de MediaFire no existe o fue eliminado.")
                 if resp.status == 429:
@@ -753,7 +858,7 @@ class CloudExtractor:
                 raise ProtectedFileError("El archivo de MediaFire está protegido con contraseña.")
 
             direct_url = None
-            m_scram = re.search(r'data-scrambled-url=["\']([^"\']+)["\']', page)
+            m_scram = _MF_SCRAMBLED_RE.search(page)
             if m_scram:
                 try:
                     direct_url = base64.b64decode(m_scram.group(1)).decode("utf-8")
@@ -761,16 +866,12 @@ class CloudExtractor:
                     direct_url = None
 
             if not direct_url:
-                m_btn = re.search(
-                    r'id=["\']downloadButton["\'][^>]*href=["\'](https?://[^"\']+)["\']',
-                    page,
-                    re.I,
-                )
+                m_btn = _MF_BTN_RE.search(page)
                 if m_btn:
                     direct_url = html.unescape(m_btn.group(1))
 
             if not direct_url:
-                m_dl = re.search(r"(https?://download[0-9]*\.mediafire\.com/[^\s\"'<>]+)", page)
+                m_dl = _MF_INLINE_DL_RE.search(page)
                 if m_dl:
                     direct_url = html.unescape(m_dl.group(1))
 
@@ -780,7 +881,7 @@ class CloudExtractor:
             fname = api_filename or _sanitize_filename(os.path.basename(urllib.parse.urlparse(direct_url).path))
             size = api_size
             try:
-                async with session.head(direct_url, allow_redirects=True) as hresp:
+                async with active_sess.head(direct_url, headers={"User-Agent": DEFAULT_UA}, allow_redirects=True) as hresp:
                     cd_name = _extract_filename_from_cd(hresp.headers.get("Content-Disposition", ""))
                     if cd_name:
                         fname = cd_name
@@ -801,13 +902,8 @@ class CloudExtractor:
 
     async def _resolve_gdrive(self, url: str) -> ResolvedDownload:
         file_id = None
-        patterns = [
-            r"/file/d/([a-zA-Z0-9_-]{10,})",
-            r"[?&]id=([a-zA-Z0-9_-]{10,})",
-            r"/d/([a-zA-Z0-9_-]{10,})",
-        ]
-        for pat in patterns:
-            m = re.search(pat, url)
+        for pat in _GDRIVE_ID_PATTERNS:
+            m = pat.search(url)
             if m:
                 file_id = m.group(1)
                 break
@@ -861,19 +957,18 @@ class CloudExtractor:
             if "accounts.google.com/ServiceLogin" in page or "You need access" in page:
                 raise ProtectedFileError("El archivo de Google Drive es privado y requiere iniciar sesión.")
 
-            m_action = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', page)
+            m_action = _GDRIVE_FORM_RE.search(page)
             action_url = html.unescape(m_action.group(1)) if m_action else "https://drive.usercontent.google.com/download"
             params: dict[str, str] = {"id": file_id, "export": "download", "confirm": "t"}
-            for m_inp in re.finditer(r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"', page):
+            for m_inp in _GDRIVE_INPUT_RE.finditer(page):
                 params[m_inp.group(1)] = html.unescape(m_inp.group(2))
 
             confirmed_url = f"{action_url}?{urllib.parse.urlencode(params)}"
             fname = f"gdrive_{file_id}.bin"
-            m_name = re.search(r'class="uc-name-size"[^>]*>\s*<a[^>]*>([^<]+)</a>', page)
+            m_name = _GDRIVE_NAME_RE.search(page)
             if m_name:
                 fname = _sanitize_filename(html.unescape(m_name.group(1)))
 
-            size = 0
             cookies = "; ".join(f"{c.key}={c.value}" for c in jar)
             req_headers = dict(headers)
             if cookies:
@@ -884,22 +979,27 @@ class CloudExtractor:
                 direct_url=confirmed_url,
                 filename=fname,
                 host="Google Drive",
-                size=size,
+                size=0,
                 headers=req_headers,
                 extractor_type="gdrive",
             )
 
-    async def _resolve_onedrive(self, url: str) -> ResolvedDownload:
+    async def _resolve_onedrive(
+        self,
+        url: str,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> ResolvedDownload:
         headers = {"User-Agent": DEFAULT_UA}
         b64 = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
         api_url = f"https://api.onedrive.com/v1.0/shares/u!{b64}/root/content"
 
-        async with aiohttp.ClientSession(timeout=self.timeout, headers=headers) as session:
+        ctx = nullcontext(session) if session else aiohttp.ClientSession(timeout=self.timeout, headers=headers)
+        async with ctx as active_sess:
             try:
-                async with session.get(api_url, allow_redirects=False) as resp:
+                async with active_sess.get(api_url, headers=headers, allow_redirects=False) as resp:
                     if resp.status in (301, 302, 303, 307, 308) and "Location" in resp.headers:
                         direct_url = resp.headers["Location"]
-                        async with session.head(direct_url, allow_redirects=True) as hresp:
+                        async with active_sess.head(direct_url, headers=headers, allow_redirects=True) as hresp:
                             fname = _extract_filename_from_cd(hresp.headers.get("Content-Disposition", ""))
                             if not fname:
                                 fname = _sanitize_filename(os.path.basename(urllib.parse.urlparse(direct_url).path))
@@ -916,7 +1016,7 @@ class CloudExtractor:
             except Exception:
                 pass
 
-            async with session.get(url, allow_redirects=True) as resp:
+            async with active_sess.get(url, headers=headers, allow_redirects=True) as resp:
                 if resp.status == 404:
                     raise DeadLinkError("El enlace de OneDrive no existe o expiró (HTTP 404).")
                 if resp.status in (401, 403):
@@ -928,7 +1028,7 @@ class CloudExtractor:
                 q["download"] = ["1"]
                 dl_url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(q, doseq=True)))
 
-                async with session.head(dl_url, allow_redirects=True) as hresp:
+                async with active_sess.head(dl_url, headers=headers, allow_redirects=True) as hresp:
                     if hresp.status == 404:
                         raise DeadLinkError("Archivo de OneDrive no encontrado.")
                     ctype = hresp.headers.get("Content-Type", "")
@@ -996,17 +1096,17 @@ class CloudExtractor:
                     "Without premium status",
                 )
             ):
-                m_wait = re.search(r"You must wait\s+([^.<]+)", page)
+                m_wait = _1FICHIER_WAIT_RE.search(page)
                 wait_info = f" ({m_wait.group(1).strip()})" if m_wait else ""
                 raise BandwidthLimitError(f"Límite gratuito de 1fichier activo{wait_info}.")
 
             fname = "1fichier_download.bin"
-            m_name = re.search(r">File Name\s*:\s*</td>\s*<td[^>]*>([^<]+)</td>", page, re.I)
+            m_name = _1FICHIER_NAME_RE.search(page)
             if m_name:
                 fname = _sanitize_filename(html.unescape(m_name.group(1)))
 
             form_data = {"dl_no_ssl": "on", "dlinline": "on"}
-            m_adz = re.search(r'name="adz"\s+value="([^"]+)"', page)
+            m_adz = _1FICHIER_ADZ_RE.search(page)
             if m_adz:
                 form_data["adz"] = m_adz.group(1)
 
@@ -1015,10 +1115,7 @@ class CloudExtractor:
                     direct_url = post_resp.headers["Location"]
                 else:
                     post_page = await post_resp.text(errors="replace")
-                    m_link = re.search(
-                        r'<a[^>]+href=["\'](https?://[a-zA-Z0-9.-]+\.1fichier\.com/[^"\']+)["\']',
-                        post_page,
-                    )
+                    m_link = _1FICHIER_LINK_RE.search(post_page)
                     if not m_link:
                         if "You must wait" in post_page:
                             raise BandwidthLimitError("1fichier solicita tiempo de espera entre descargas gratuitas.")
@@ -1045,7 +1142,12 @@ class CloudExtractor:
                 extractor_type="1fichier",
             )
 
-    async def _resolve_direct(self, url: str, host: str) -> ResolvedDownload:
+    async def _resolve_direct(
+        self,
+        url: str,
+        host: str,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> ResolvedDownload:
         headers = {"User-Agent": DEFAULT_UA}
         if os.path.isfile(url) and url.lower().endswith(".torrent"):
             fname = _sanitize_filename(os.path.basename(url))
@@ -1082,13 +1184,13 @@ class CloudExtractor:
             if dn:
                 fname = _sanitize_filename(dn)
             else:
-                m_btih = re.search(r"xt=urn:btih:([a-zA-Z0-9]+)", url, re.I)
+                m_btih = _MAGNET_BTIH_RE.search(url)
                 fname = f"magnet_{m_btih.group(1)[:12]}.torrent" if m_btih else "magnet_download"
             return ResolvedDownload(
                 original_url=url,
                 direct_url=url,
                 filename=fname,
-                host="BitTorrent (Magnet)",
+                host="BitTorrent (Enlace magnético)",
                 size=0,
                 headers={},
                 extractor_type="magnet",
@@ -1106,14 +1208,15 @@ class CloudExtractor:
                 extractor_type="direct",
             )
 
-        async with aiohttp.ClientSession(timeout=self.timeout, headers=headers) as session:
+        ctx = nullcontext(session) if session else aiohttp.ClientSession(timeout=self.timeout, headers=headers)
+        async with ctx as active_sess:
             resp_url = url
             size = 0
             fname = None
             status = 200
 
             try:
-                async with session.head(url, allow_redirects=True) as resp:
+                async with active_sess.head(url, headers=headers, allow_redirects=True) as resp:
                     status = resp.status
                     resp_url = str(resp.url)
                     if status < 400:
@@ -1125,17 +1228,10 @@ class CloudExtractor:
             if status in (0, 403, 405) or size == 0:
                 range_headers = dict(headers)
                 range_headers["Range"] = "bytes=0-0"
-                async with session.get(url, headers=range_headers, allow_redirects=True) as gresp:
+                async with active_sess.get(url, headers=range_headers, allow_redirects=True) as gresp:
                     status = gresp.status
                     resp_url = str(gresp.url)
-                    if status == 404:
-                        raise DeadLinkError(f"Enlace caído (HTTP 404): {url}")
-                    if status in (401, 403):
-                        raise ProtectedFileError(f"Acceso denegado o protegido (HTTP {status}): {url}")
-                    if status == 429:
-                        raise BandwidthLimitError(f"Límite de ancho de banda / peticiones (HTTP 429): {url}")
-                    if status >= 400:
-                        raise ExtractorError(f"Error HTTP {status} al verificar enlace: {url}")
+                    _raise_for_http_status(status, url)
 
                     cr = gresp.headers.get("Content-Range", "")
                     if "/" in cr:
@@ -1147,14 +1243,7 @@ class CloudExtractor:
                     if not fname:
                         fname = _extract_filename_from_cd(gresp.headers.get("Content-Disposition", ""))
             else:
-                if status == 404:
-                    raise DeadLinkError(f"Enlace caído (HTTP 404): {url}")
-                if status in (401, 403):
-                    raise ProtectedFileError(f"Acceso denegado (HTTP {status}): {url}")
-                if status == 429:
-                    raise BandwidthLimitError(f"Límite de ancho de banda (HTTP 429): {url}")
-                if status >= 400:
-                    raise ExtractorError(f"Error HTTP {status}: {url}")
+                _raise_for_http_status(status, url)
 
             if not fname:
                 path_part = urllib.parse.urlparse(resp_url).path

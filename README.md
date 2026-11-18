@@ -1,70 +1,49 @@
 # Mint Downloader
 
-Gestor de descargas simultáneas de alto rendimiento, nativo y ligero para **Linux Mint** (Ubuntu/Debian), desarrollado en **Rust** con interfaz **GTK4 + Libadwaita** como alternativa moderna y de bajo consumo de RAM (< 30 MB en reposo) frente a JDownloader.
+Gestor de descargas simultáneas nativo, ligero y ultrarrápido para **Linux Mint** (Ubuntu/Debian), construido con **Python**, **GTK4**, **aria2c JSON-RPC**, **yt-dlp/ffmpeg** y extensión estilo IDM para **Firefox**.
 
-## Características Principales
-- **Motor Asíncrono Multi-Hilo (`tokio` + `reqwest` HTTP/2):** Descarga segmentada mediante cabeceras `Range: bytes=start-end` (8 hilos por archivo por defecto).
-- **Dynamic Chunk Stealing:** Cuando un hilo finaliza su segmento antes de tiempo, divide automáticamente a la mitad el segmento activo con mayor cantidad de bytes pendientes para saturar el 100% del ancho de banda disponible hasta el último byte.
-- **Persistencia Transaccional en SQLite (`rusqlite` WAL):** Guarda el estado de cada descarga (`Queued`, `Downloading`, `Paused`, `Completed`, `Error`) y el byte exacto de cada fragmento (`chunks`). Permite pausar, cerrar la aplicación y reanudar sin pérdida ni corrupción de datos.
-- **Sistema Modular de Resolvers (`HostResolver`):**
-  - **MEGA:** Descifrado en streaming **AES-128-CTR al vuelo** con búsqueda de desplazamiento (`StreamCipherSeek`) compatible con descargas multi-hilo sin esperar al final.
-  - **MediaFire, Google Drive** (bypass de confirmación de escaneo de virus en archivos grandes), **OneDrive** y **1fichier** (manejo de cookies y token `adz`).
-  - **Video y Streaming (`yt-dlp` + `ffmpeg`):** Extracción de metadatos y calidades (`yt-dlp --dump-json`) y descarga de flujos YouTube, Twitch, Vimeo y manifiestos HLS/DASH (`.m3u8` / `.mpd`).
-- **Interfaz Gráfica GTK4 + Libadwaita:** Actualización reactiva limitada a **10 FPS (100 ms)** mediante canales `tokio::sync::mpsc` para evitar uso de CPU a altas velocidades de red, con detección automática de enlaces en el portapapeles.
+## Características principales
+- **Motor acelerado (`aria2c` + `asyncio`):** Hasta 16 conexiones simultáneas por archivo, soporte BitTorrent (`.torrent` y enlaces magnéticos) y control global de descargas concurrentes y límite de velocidad.
+- **Extractores modulares:**
+  - **Nube y enlaces directos:** MEGA (con descifrado local AES-128-CTR en streaming), MediaFire (incluyendo expansión de carpetas, lectura de cookies/historial de Firefox y verificación en navegador), Google Drive, OneDrive y 1fichier.
+  - **Video y transmisión web (`yt-dlp` + `ffmpeg`):** Selector dinámico de calidades (hasta 4K UHD y extracción de audio MP3) para YouTube, Twitch, Vimeo y transmisiones HLS/DASH (`.m3u8` / `.mpd`).
+- **Extensión Firefox IDM (`firefox-extension/`):** Panel flotante arrastrable sobre reproductores web con selector `Calidad/...`, captura automática de descargas del navegador y puente HTTP local (`127.0.0.1:16890`).
+- **Persistencia SQLite WAL:** Guarda la cola, contenedores/paquetes, carpeta de destino y fondo personalizado entre sesiones.
+- **Interfaz GTK4 nativa en español:** Barra superior organizada de doble fila con botones uniformes, panel lateral de categorías (`Todas las descargas`, `Música`, `Comprimidos`, `Videos`, `Programas`, `Documentos`, `APKs`, `Imágenes`, `Sin terminar`, `Terminadas`), búsqueda instantánea, selección múltiple y fondo personalizable por color o imagen.
 
-## Instalación de Dependencias en Linux Mint (Ubuntu / Debian)
-
-Para compilar y ejecutar desde el código fuente en Linux Mint:
-
-```bash
-sudo apt update
-sudo apt install -y \
-    build-essential \
-    pkg-config \
-    libgtk-4-dev \
-    libadwaita-1-dev \
-    libsqlite3-dev \
-    libssl-dev \
-    yt-dlp \
-    ffmpeg \
-    dpkg-dev
-```
-
-## Estructura del Workspace
+## Estructura del proyecto
 
 ```text
 mint-downloader/
-├── Cargo.toml                  # Configuración del Cargo Workspace y perfil release (LTO + strip)
-├── build-deb.sh                # Script automatizado para generar el paquete instalador .deb
-├── packaging/
-│   └── mint-downloader.desktop # Lanzador de escritorio para Linux Mint (Cinnamon/MATE/Xfce)
-├── core-engine/                # Biblioteca del motor de descargas, SQLite y Resolvers
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs              # API pública y suite de pruebas unitarias/integración
-│       ├── models.rs           # Estructuras de datos, estados y comandos
-│       ├── db.rs               # Capa de persistencia en SQLite (tablas downloads y chunks)
-│       ├── downloader.rs       # Motor HTTP Range multi-hilo, Dynamic Chunk Stealing y AES-128-CTR
-│       ├── resolvers.rs        # Trait HostResolver y plugins (MEGA, GDrive, MediaFire, OneDrive, 1fichier, yt-dlp)
-│       └── engine.rs           # Orquestador de cola y emisor de telemetría a 10 FPS
-└── mint-downloader-gui/        # Interfaz gráfica nativa GTK4 + Libadwaita
-    ├── Cargo.toml
-    └── src/
-        ├── main.rs             # Inicialización de Tokio runtime, SQLite y aplicación Adwaita
-        └── ui.rs               # Ventana principal, HeaderBar, tabla de progreso y modal de enlaces
+├── main.py                              # Punto de entrada y autodiagnóstico (--self-test)
+├── install.sh                           # Instalador automático y lanzador .desktop
+├── core/
+│   ├── engine.py                        # Orquestador aria2c JSON-RPC, puente HTTP y SQLite WAL
+│   └── extractors/
+│       ├── cloud_extractor.py           # MEGA, MediaFire, Google Drive, OneDrive, 1fichier y directos
+│       └── video_extractor.py           # yt-dlp + ffmpeg y caché de calidades
+├── ui/
+│   └── main_window.py                   # Interfaz GTK4 completa en español
+├── firefox-extension/                   # Extensión estilo IDM para Firefox (.xpi)
+└── assets/                              # Iconos SVG/PNG de la aplicación
 ```
 
-## Compilación y Empaquetado `.deb`
+## Instalación y ejecución
 
 ```bash
-# Ejecutar pruebas unitarias (descarga segmentada, Dynamic Chunk Stealing, pausa/reanudación y MEGA AES-CTR)
-cargo test --workspace
+./install.sh
+```
 
-# Construir binario optimizado y paquete .deb
-./build-deb.sh
+Para verificar el estado de todos los subsistemas (`Python`, `GTK4`, `aria2c`, `yt-dlp`, `ffmpeg` y `SQLite`):
 
-# Instalar el paquete .deb en Linux Mint
-sudo dpkg -i mint-downloader_0.1.0_amd64.deb
+```bash
+python3 main.py --self-test
+```
+
+Para iniciar la aplicación directamente:
+
+```bash
+python3 main.py
 ```
 ### Aviso
 # Hecho totaltemente con IA.

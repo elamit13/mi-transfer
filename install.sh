@@ -41,6 +41,7 @@ if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
                 for deb in ./*.deb; do
                     dpkg-deb -x "${deb}" "${APP_DIR}/.local_deps"
                 done
+                rm -rf "${APP_DIR}/.local_deps/usr/share"
             )
             rm -rf "${TMP_DEB_DIR}"
         fi
@@ -61,7 +62,7 @@ else
     echo "[OK] yt-dlp detectado en: $(command -v yt-dlp)"
 fi
 
-# 3. Verificar entorno virtual local con paquetes del sistema (PyGObject + aiohttp + pycryptodomex)
+# 3. Verificar entorno virtual local con paquetes del sistema (PyGObject + aiohttp + pycryptodomex + yt_dlp)
 if [ -x "${APP_DIR}/.venv/bin/python" ] && "${APP_DIR}/.venv/bin/python" -c "import aiohttp, Cryptodome, yt_dlp" >/dev/null 2>&1; then
     echo "[OK] Entorno virtual Python (.venv) verificado con aiohttp, Cryptodome y yt_dlp."
 elif ! python3 -c "import aiohttp, Cryptodome, yt_dlp" >/dev/null 2>&1; then
@@ -72,11 +73,16 @@ elif ! python3 -c "import aiohttp, Cryptodome, yt_dlp" >/dev/null 2>&1; then
             python3 -m venv --system-site-packages "${APP_DIR}/.venv"
         fi
     fi
-    if command -v uv >/dev/null 2>&1; then
-        uv pip install --python "${APP_DIR}/.venv/bin/python" aiohttp pycryptodomex yt-dlp
-    else
-        "${APP_DIR}/.venv/bin/pip" install aiohttp pycryptodomex yt-dlp
+    PIP_PKGS=("aiohttp" "yt-dlp")
+    if ! "${APP_DIR}/.venv/bin/python" -c "import Cryptodome" >/dev/null 2>&1; then
+        PIP_PKGS+=("pycryptodomex")
     fi
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "${APP_DIR}/.venv/bin/python" "${PIP_PKGS[@]}"
+    else
+        "${APP_DIR}/.venv/bin/pip" install "${PIP_PKGS[@]}"
+    fi
+    rm -rf "${APP_DIR}/.venv/share"
 fi
 
 # 4. Dar permisos de ejecución al punto de entrada

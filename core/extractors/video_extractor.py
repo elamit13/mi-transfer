@@ -10,6 +10,7 @@ import asyncio
 import os
 import shutil
 import threading
+import time
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
@@ -96,27 +97,54 @@ class DownloadCancelledError(Exception):
 class VideoExtractor:
     """Handles metadata extraction and high-speed video/HLS downloading with yt-dlp + ffmpeg."""
 
+    _QUALITIES_CACHE_TTL = 120.0
+    _QUALITIES_CACHE_MAX = 32
+
     def __init__(self, aria2c_path: Optional[str] = None, ffmpeg_path: Optional[str] = None) -> None:
         self.aria2c_path = aria2c_path or shutil.which("aria2c")
         self.ffmpeg_path = ffmpeg_path or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+        self._qualities_cache: Dict[str, tuple[float, dict[str, Any]]] = {}
+
+    @staticmethod
+    def _select_ytdlp_format(url: str, quality: str) -> tuple[str, bool]:
+        u_low = url.lower()
+        is_manifest = ".m3u8" in u_low or ".mpd" in u_low
+        if is_manifest and quality in ("best", "2160p", "1440p", "1080p", "720p", "480p", "360p"):
+            return "best", True
+        if quality in QUALITY_FORMATS:
+            return QUALITY_FORMATS[quality], is_manifest
+        if quality.endswith("p") and quality[:-1].isdigit():
+            h = int(quality[:-1])
+            return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best", is_manifest
+        return quality or QUALITY_FORMATS["best"], is_manifest
 
     def _classify_ytdlp_error(self, err_msg: str) -> ExtractorError:
         low = err_msg.lower()
         if any(k in low for k in ("404", "not found", "video unavailable", "has been removed", "deleted")):
-            return DeadLinkError(f"Video o stream no disponible: {err_msg}")
+            return DeadLinkError(f"Video o transmisión no disponible: {err_msg}")
         if any(k in low for k in ("private", "sign in", "login", "members-only", "password", "age-restricted")):
             return ProtectedFileError(f"El video es privado o requiere autenticación: {err_msg}")
         if any(k in low for k in ("429", "too many requests", "rate limit", "quota")):
             return BandwidthLimitError(f"Límite de peticiones en plataforma de video: {err_msg}")
-        return ExtractorError(f"Error al extraer stream de video: {err_msg}")
+        return ExtractorError(f"Error al extraer transmisión de video: {err_msg}")
 
     async def list_qualities(self, url: str) -> dict[str, Any]:
         """
         Inspect a YouTube or streaming URL with yt-dlp and return its title, duration,
         and the exact list of available video/audio resolutions and estimated file sizes.
         """
+        now = time.monotonic()
+        cached = self._qualities_cache.get(url)
+        if cached and (now - cached[0]) < self._QUALITIES_CACHE_TTL:
+            return cached[1]
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._list_qualities_sync, url)
+        res = await loop.run_in_executor(None, self._list_qualities_sync, url)
+        if len(self._qualities_cache) >= self._QUALITIES_CACHE_MAX:
+            oldest_key = min(self._qualities_cache, key=lambda k: self._qualities_cache[k][0])
+            self._qualities_cache.pop(oldest_key, None)
+        self._qualities_cache[url] = (time.monotonic(), res)
+        return res
 
     def _list_qualities_sync(self, url: str) -> dict[str, Any]:
         ydl_opts: Dict[str, Any] = {
@@ -218,17 +246,7 @@ class VideoExtractor:
         quality: str = "best",
         custom_headers: Optional[Dict[str, str]] = None,
     ) -> ResolvedDownload:
-        u_low = url.lower()
-        is_manifest = ".m3u8" in u_low or ".mpd" in u_low
-        if is_manifest and quality in ("best", "2160p", "1440p", "1080p", "720p", "480p", "360p"):
-            fmt = "best"
-        elif quality in QUALITY_FORMATS:
-            fmt = QUALITY_FORMATS[quality]
-        elif quality.endswith("p") and quality[:-1].isdigit():
-            h = int(quality[:-1])
-            fmt = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
-        else:
-            fmt = quality or QUALITY_FORMATS["best"]
+        fmt, _ = self._select_ytdlp_format(url, quality)
         ydl_opts: Dict[str, Any] = {
             "format": fmt,
             "quiet": True,
@@ -257,12 +275,12 @@ class VideoExtractor:
                 raise self._classify_ytdlp_error(str(exc)) from exc
 
         if not info:
-            raise DeadLinkError("No se obtuvo información del enlace de video/stream.")
+            raise DeadLinkError("No se obtuvo información del enlace de video.")
 
         if "entries" in info and info["entries"]:
             info = next((e for e in info["entries"] if e), info)
 
-        title = info.get("title") or "stream_video"
+        title = info.get("title") or "video_web"
         ext = "mp3" if quality == "audio" else (info.get("ext") or "mp4")
         if ext in ("m3u8", "mpd", "unknown_video"):
             ext = "mp4"
@@ -334,18 +352,9 @@ class VideoExtractor:
             ext = ".mp3" if quality == "audio" else ".mp4"
         outtmpl = os.path.join(save_dir, f"{base_name}.%(ext)s")
 
-        u_low = url.lower()
-        is_manifest = ".m3u8" in u_low or ".mpd" in u_low
-        if is_manifest and quality in ("best", "2160p", "1440p", "1080p", "720p", "480p", "360p"):
-            fmt = "best"
-        elif quality in QUALITY_FORMATS:
-            fmt = QUALITY_FORMATS[quality]
-        elif quality.endswith("p") and quality[:-1].isdigit():
-            h = int(quality[:-1])
-            fmt = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
-        else:
-            fmt = quality or QUALITY_FORMATS["best"]
+        fmt, is_manifest = self._select_ytdlp_format(url, quality)
         state = VideoTaskProgress(filename=filename, status="active")
+        last_emit = [0.0]
 
         def _hook(d: Dict[str, Any]) -> None:
             if cancel_event and cancel_event.is_set():
@@ -353,6 +362,10 @@ class VideoExtractor:
 
             st = d.get("status")
             if st == "downloading":
+                now_mono = time.monotonic()
+                if (now_mono - last_emit[0]) < 0.12:
+                    return
+                last_emit[0] = now_mono
                 dl_bytes = int(d.get("downloaded_bytes") or 0)
                 tot_bytes = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
                 if tot_bytes <= 0:

@@ -54,6 +54,22 @@ STATUS_LABELS_ES = {
     "error": "Error",
 }
 
+_SPLIT_ARCH_RE = re.compile(r"(\.(?:zip|rar|7z)\.\d{3})$")
+_TAR_EXT_RE = re.compile(r"(\.tar\.(?:gz|bz2|xz|zst))$")
+_ORIGIN_MAP = (
+    ("youtube.com", "YouTube"),
+    ("youtu.be", "YouTube"),
+    ("mediafire.com", "MediaFire"),
+    ("mega.nz", "MEGA"),
+    ("mega.co.nz", "MEGA"),
+    ("drive.google.com", "Google Drive"),
+    ("googleusercontent.com", "Google Drive"),
+    ("1drv.ms", "OneDrive"),
+    ("onedrive.live.com", "OneDrive"),
+    ("sharepoint.com", "OneDrive"),
+    ("1fichier.com", "1fichier"),
+)
+
 
 @dataclass
 class DownloadItem:
@@ -90,15 +106,16 @@ class DownloadItem:
     def file_extension(self) -> str:
         """Return the file extension / container format (.mkv, .mp4, .mp3, .rar, .zip, etc.)."""
         name_lower = (self.filename or "").lower().strip()
-        m_split_arch = re.search(r"(\.(?:zip|rar|7z)\.\d{3})$", name_lower)
-        if m_split_arch:
-            return m_split_arch.group(1)
-        m_tar = re.search(r"(\.tar\.(?:gz|bz2|xz|zst))$", name_lower)
-        if m_tar:
-            return m_tar.group(1)
-        _, ext = os.path.splitext(name_lower)
-        if ext and len(ext) <= 10:
-            return ext
+        if "." in name_lower:
+            m_split_arch = _SPLIT_ARCH_RE.search(name_lower)
+            if m_split_arch:
+                return m_split_arch.group(1)
+            m_tar = _TAR_EXT_RE.search(name_lower)
+            if m_tar:
+                return m_tar.group(1)
+            _, ext = os.path.splitext(name_lower)
+            if ext and len(ext) <= 10:
+                return ext
         ext_extra = str(self.extra.get("ext") or "").strip().lower()
         if ext_extra:
             return ext_extra if ext_extra.startswith(".") else f".{ext_extra}"
@@ -118,29 +135,17 @@ class DownloadItem:
         for candidate_url in (source_page, self.url, self.direct_url):
             if not candidate_url:
                 continue
-            low = candidate_url.lower()
-            if low.startswith("magnet:?"):
+            if candidate_url[:7].lower() == "magnet:":
                 return "BitTorrent"
             try:
-                netloc = (urllib.parse.urlparse(candidate_url).netloc or "").lower()
+                netloc = (urllib.parse.urlparse(candidate_url).netloc or "").lower().removeprefix("www.")
             except Exception:
                 netloc = ""
-            if netloc.startswith("www."):
-                netloc = netloc[4:]
             if not netloc:
                 continue
-            if "youtube.com" in netloc or "youtu.be" in netloc:
-                return "YouTube"
-            if "mediafire.com" in netloc:
-                return "MediaFire"
-            if "mega.nz" in netloc or "mega.co.nz" in netloc:
-                return "MEGA"
-            if "drive.google.com" in netloc or "googleusercontent.com" in netloc:
-                return "Google Drive"
-            if "1drv.ms" in netloc or "onedrive.live.com" in netloc or "sharepoint.com" in netloc:
-                return "OneDrive"
-            if "1fichier.com" in netloc:
-                return "1fichier"
+            for dom_frag, friendly in _ORIGIN_MAP:
+                if dom_frag in netloc:
+                    return friendly
             return netloc
         return self.host or "Directo"
 
@@ -235,7 +240,7 @@ class DownloadEngine:
         self.video_extractor = VideoExtractor(aria2c_path=self.aria2_bin)
 
         self.items: Dict[int, DownloadItem] = {}
-        self._gid_to_id: Dict[str, int] = {}
+        self.state_version: int = 0
         self._video_cancel_events: Dict[int, threading.Event] = {}
         self._video_tasks: Dict[int, asyncio.Task] = {}
         self._decrypt_tasks: set[int] = set()
@@ -245,12 +250,21 @@ class DownloadEngine:
         self._running = False
         self._last_browser_sync: float = 0.0
         self._db_lock = threading.Lock()
+        self._db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._db_conn.row_factory = sqlite3.Row
 
         self._init_db()
         self._load_state_from_db()
 
+    def _bump_version(self) -> None:
+        self.state_version += 1
+
     def _init_db(self) -> None:
-        with self._db_lock, sqlite3.connect(self.db_path) as conn:
+        with self._db_lock, self._db_conn as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-4000")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS settings (
@@ -281,11 +295,9 @@ class DownloadEngine:
                 )
                 """
             )
-            conn.commit()
 
     def _load_state_from_db(self) -> None:
-        with self._db_lock, sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with self._db_lock, self._db_conn as conn:
             for row in conn.execute("SELECT key, value FROM settings"):
                 k, v = row["key"], row["value"]
                 if k == "save_dir" and os.path.isdir(v):
@@ -312,7 +324,10 @@ class DownloadEngine:
                     except ValueError:
                         pass
 
-            for row in conn.execute("SELECT * FROM downloads ORDER BY id ASC"):
+            for row in conn.execute(
+                "SELECT id, url, direct_url, filename, host, save_dir, total_size, completed_size, "
+                "status, error_msg, extractor_type, headers_json, extra_json FROM downloads ORDER BY id ASC"
+            ):
                 st = row["status"]
                 if st in ("active", "resolving", "merging", "decrypting"):
                     st = "paused"
@@ -332,25 +347,27 @@ class DownloadEngine:
                     headers=json.loads(row["headers_json"] or "{}"),
                     extra=json.loads(row["extra_json"] or "{}"),
                 )
-                target_file = os.path.join(item.save_dir, item.filename)
-                if item.status != "complete" and os.path.exists(target_file):
-                    disk_sz = os.path.getsize(target_file)
-                    if disk_sz > item.completed_size:
-                        item.completed_size = disk_sz
+                if item.status != "complete":
+                    try:
+                        disk_sz = os.stat(os.path.join(item.save_dir, item.filename)).st_size
+                        if disk_sz > item.completed_size:
+                            item.completed_size = disk_sz
+                    except OSError:
+                        pass
                 self.items[item.id] = item
+        self._bump_version()
 
     def _save_setting(self, key: str, value: str) -> None:
-        with self._db_lock, sqlite3.connect(self.db_path) as conn:
+        with self._db_lock, self._db_conn as conn:
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, str(value)),
             )
-            conn.commit()
 
     def _insert_item_db(self, item: DownloadItem) -> int:
         now = time.time()
-        with self._db_lock, sqlite3.connect(self.db_path) as conn:
+        with self._db_lock, self._db_conn as conn:
             cur = conn.execute(
                 """
                 INSERT INTO downloads (
@@ -377,12 +394,11 @@ class DownloadEngine:
                     now,
                 ),
             )
-            conn.commit()
             return int(cur.lastrowid)
 
     def _update_item_db(self, item: DownloadItem) -> None:
         now = time.time()
-        with self._db_lock, sqlite3.connect(self.db_path) as conn:
+        with self._db_lock, self._db_conn as conn:
             conn.execute(
                 """
                 UPDATE downloads SET
@@ -408,12 +424,10 @@ class DownloadEngine:
                     item.id,
                 ),
             )
-            conn.commit()
 
     def _delete_item_db(self, item_id: int) -> None:
-        with self._db_lock, sqlite3.connect(self.db_path) as conn:
+        with self._db_lock, self._db_conn as conn:
             conn.execute("DELETE FROM downloads WHERE id=?", (item_id,))
-            conn.commit()
 
     async def start(self) -> None:
         """Start the aria2c JSON-RPC daemon and initialize the async HTTP session."""
@@ -457,7 +471,8 @@ class DownloadEngine:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        connector = aiohttp.TCPConnector(limit=32, ttl_dns_cache=300)
+        self._session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=25))
         self._running = True
 
         for _ in range(30):
@@ -477,11 +492,42 @@ class DownloadEngine:
         for ev in list(self._video_cancel_events.values()):
             ev.set()
 
+        now = time.time()
+        changed_rows = []
         for item in self.items.values():
             if item.status in ("active", "resolving", "merging", "decrypting"):
                 item.status = "paused"
                 item.speed = 0.0
-            self._update_item_db(item)
+                changed_rows.append(
+                    (
+                        item.gid,
+                        item.direct_url,
+                        item.filename,
+                        item.host,
+                        item.save_dir,
+                        item.total_size,
+                        item.completed_size,
+                        item.status,
+                        item.error_msg,
+                        item.extractor_type,
+                        json.dumps(item.headers),
+                        json.dumps(item.extra),
+                        now,
+                        item.id,
+                    )
+                )
+        if changed_rows:
+            with self._db_lock, self._db_conn as conn:
+                conn.executemany(
+                    """
+                    UPDATE downloads SET
+                        gid=?, direct_url=?, filename=?, host=?, save_dir=?,
+                        total_size=?, completed_size=?, status=?, error_msg=?,
+                        extractor_type=?, headers_json=?, extra_json=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    changed_rows,
+                )
 
         if self._bridge_runner:
             try:
@@ -508,6 +554,12 @@ class DownloadEngine:
                 except Exception:
                     pass
             self.aria2_proc = None
+
+        try:
+            with self._db_lock:
+                self._db_conn.close()
+        except Exception:
+            pass
 
     async def _start_browser_bridge(self) -> None:
         """
@@ -608,7 +660,8 @@ class DownloadEngine:
 
     async def rpc_call(self, method: str, params: Optional[List[Any]] = None) -> Any:
         if not self._session:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+            connector = aiohttp.TCPConnector(limit=32, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=25))
         rpc_params: List[Any] = [f"token:{self.rpc_secret}"]
         if params:
             rpc_params.extend(params)
@@ -623,6 +676,45 @@ class DownloadEngine:
             if "error" in data:
                 raise RuntimeError(data["error"].get("message", str(data["error"])))
             return data.get("result")
+
+    async def rpc_multicall_status(self, gids: List[str], keys: List[str]) -> List[Optional[Dict[str, Any]]]:
+        """Fetch aria2.tellStatus for multiple GIDs in a single JSON-RPC system.multicall HTTP round-trip."""
+        if not gids:
+            return []
+        if len(gids) == 1:
+            try:
+                return [await self.rpc_call("aria2.tellStatus", [gids[0], keys])]
+            except Exception:
+                return [None]
+
+        calls = [
+            {"methodName": "aria2.tellStatus", "params": [f"token:{self.rpc_secret}", gid, keys]}
+            for gid in gids
+        ]
+        if not self._session:
+            connector = aiohttp.TCPConnector(limit=32, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=25))
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "mint-dl-batch",
+            "method": "system.multicall",
+            "params": [calls],
+        }
+        try:
+            async with self._session.post(self.rpc_url, json=payload) as resp:
+                data = await resp.json()
+                raw_results = data.get("result")
+                if not isinstance(raw_results, list):
+                    return [None] * len(gids)
+                out: List[Optional[Dict[str, Any]]] = []
+                for entry in raw_results:
+                    if isinstance(entry, list) and entry and isinstance(entry[0], dict):
+                        out.append(entry[0])
+                    else:
+                        out.append(None)
+                return out
+        except Exception:
+            return [None] * len(gids)
 
     @staticmethod
     def _ensure_unique_filename(save_dir: str, filename: str, item_id: int, existing_items: Dict[int, DownloadItem]) -> str:
@@ -673,6 +765,7 @@ class DownloadEngine:
     async def set_max_concurrent(self, limit: int) -> None:
         self.max_concurrent = max(1, min(16, int(limit)))
         self._save_setting("max_concurrent", str(self.max_concurrent))
+        self._bump_version()
         if self._running:
             try:
                 await self.rpc_call(
@@ -734,7 +827,7 @@ class DownloadEngine:
             # Expand multi-file folder links (e.g., MediaFire /folder/<key>/#<subkey>)
             if self.cloud_extractor.is_folder_url(url):
                 try:
-                    entries = await self.cloud_extractor.expand_folder(url)
+                    entries = await self.cloud_extractor.expand_folder(url, session=self._session)
                     for entry in entries:
                         entry_dir = (
                             os.path.join(target_dir, entry.subfolder)
@@ -759,6 +852,7 @@ class DownloadEngine:
                         )
                         item.id = self._insert_item_db(item)
                         self.items[item.id] = item
+                        self._bump_version()
                         added.append(item)
                         asyncio.create_task(self._resolve_and_enqueue(item, auto_start=auto_start))
                     continue
@@ -775,6 +869,7 @@ class DownloadEngine:
                     )
                     item.id = self._insert_item_db(item)
                     self.items[item.id] = item
+                    self._bump_version()
                     added.append(item)
                     continue
 
@@ -791,6 +886,7 @@ class DownloadEngine:
                             existing.error_msg = ""
                             existing.status = "queued"
                             self._update_item_db(existing)
+                            self._bump_version()
                             if auto_start:
                                 asyncio.create_task(self.start_task(existing.id))
                             added.append(existing)
@@ -822,6 +918,7 @@ class DownloadEngine:
             )
             item.id = self._insert_item_db(item)
             self.items[item.id] = item
+            self._bump_version()
             added.append(item)
             asyncio.create_task(self._resolve_and_enqueue(item, auto_start=auto_start))
 
@@ -837,7 +934,7 @@ class DownloadEngine:
                     custom_headers=item.headers if item.headers else None,
                 )
             else:
-                resolved = await self.cloud_extractor.resolve(item.url)
+                resolved = await self.cloud_extractor.resolve(item.url, session=self._session)
 
             item.direct_url = resolved.direct_url
             hint = str(item.extra.get("filename_hint") or "").strip()
@@ -848,7 +945,6 @@ class DownloadEngine:
                     hint = f"{hint}.mp4"
                 raw_fname = _sanitize_filename(hint)
             elif any(res_base_low.startswith(g) for g in generic_hls_names):
-                # Distinguish generic HLS streams using a short hash of the stream path if no page title hint was sent
                 url_path = urllib.parse.urlparse(item.url).path.strip("/")
                 parts = [p for p in url_path.split("/") if p]
                 token_tag = parts[-2][:8] if len(parts) >= 2 else f"stream_{item.id}"
@@ -870,6 +966,7 @@ class DownloadEngine:
             item.error_msg = ""
             item.status = "queued"
             self._update_item_db(item)
+            self._bump_version()
 
             if auto_start:
                 await self.start_task(item.id)
@@ -878,10 +975,12 @@ class DownloadEngine:
             item.status = "error"
             item.error_msg = str(exc)
             self._update_item_db(item)
+            self._bump_version()
         except Exception as exc:
             item.status = "error"
             item.error_msg = f"Error inesperado: {exc}"
             self._update_item_db(item)
+            self._bump_version()
 
     async def start_task(self, item_id: int) -> None:
         item = self.items.get(item_id)
@@ -892,6 +991,7 @@ class DownloadEngine:
             item.status = "resolving"
             item.error_msg = ""
             self._update_item_db(item)
+            self._bump_version()
             await self._resolve_and_enqueue(item, auto_start=True)
             return
 
@@ -906,6 +1006,7 @@ class DownloadEngine:
                     await self.rpc_call("aria2.unpause", [item.gid])
                     item.status = "active"
                     self._update_item_db(item)
+                    self._bump_version()
                     return
             except Exception:
                 item.gid = ""
@@ -935,14 +1036,15 @@ class DownloadEngine:
             else:
                 gid = await self.rpc_call("aria2.addUri", [[item.direct_url], options])
             item.gid = str(gid)
-            self._gid_to_id[item.gid] = item.id
             item.status = "active"
             item.error_msg = ""
             self._update_item_db(item)
+            self._bump_version()
         except Exception as exc:
             item.status = "error"
             item.error_msg = f"Fallo al iniciar en aria2c: {exc}"
             self._update_item_db(item)
+            self._bump_version()
 
     async def _start_video_task(self, item: DownloadItem) -> None:
         if item.id in self._video_tasks and not self._video_tasks[item.id].done():
@@ -953,6 +1055,7 @@ class DownloadEngine:
         item.status = "active"
         item.error_msg = ""
         self._update_item_db(item)
+        self._bump_version()
 
         def _on_progress(prog: VideoTaskProgress) -> None:
             item.completed_size = prog.downloaded_bytes
@@ -962,6 +1065,7 @@ class DownloadEngine:
             item.eta = prog.eta
             if prog.status in ("active", "merging"):
                 item.status = prog.status
+            self._bump_version()
 
         async def _runner() -> None:
             try:
@@ -995,6 +1099,10 @@ class DownloadEngine:
                 item.speed = 0.0
                 item.eta = 0
                 self._update_item_db(item)
+            finally:
+                self._video_tasks.pop(item.id, None)
+                self._video_cancel_events.pop(item.id, None)
+                self._bump_version()
 
         self._video_tasks[item.id] = asyncio.create_task(_runner())
 
@@ -1011,6 +1119,7 @@ class DownloadEngine:
             item.speed = 0.0
             item.eta = 0
             self._update_item_db(item)
+            self._bump_version()
             return
 
         if item.gid:
@@ -1022,6 +1131,7 @@ class DownloadEngine:
         item.speed = 0.0
         item.eta = 0
         self._update_item_db(item)
+        self._bump_version()
 
     async def stop_task(self, item_id: int) -> None:
         item = self.items.get(item_id)
@@ -1036,6 +1146,7 @@ class DownloadEngine:
             item.speed = 0.0
             item.eta = 0
             self._update_item_db(item)
+            self._bump_version()
             return
 
         if item.gid:
@@ -1043,13 +1154,13 @@ class DownloadEngine:
                 await self.rpc_call("aria2.forceRemove", [item.gid])
             except Exception:
                 pass
-            self._gid_to_id.pop(item.gid, None)
             item.gid = ""
 
         item.status = "stopped"
         item.speed = 0.0
         item.eta = 0
         self._update_item_db(item)
+        self._bump_version()
 
     async def remove_task(self, item_id: int, delete_files: bool = False) -> None:
         item = self.items.get(item_id)
@@ -1057,6 +1168,8 @@ class DownloadEngine:
             return
 
         await self.stop_task(item_id)
+        self._video_tasks.pop(item_id, None)
+        self._video_cancel_events.pop(item_id, None)
         if item.gid:
             try:
                 await self.rpc_call("aria2.removeDownloadResult", [item.gid])
@@ -1074,20 +1187,22 @@ class DownloadEngine:
                 candidates.append(os.path.join(item.save_dir, enc_name))
                 candidates.append(os.path.join(item.save_dir, f"{enc_name}.aria2"))
             for path in candidates:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
         self.items.pop(item_id, None)
         self._delete_item_db(item_id)
+        self._bump_version()
 
     async def clear_completed(self) -> int:
         """Remove all completed downloads from the queue and database without deleting finished files on disk."""
         completed_ids = [
             item_id for item_id, item in list(self.items.items()) if item.status == "complete"
         ]
+        if not completed_ids:
+            return 0
         for item_id in completed_ids:
             item = self.items.pop(item_id, None)
             if item and item.gid:
@@ -1095,17 +1210,25 @@ class DownloadEngine:
                     await self.rpc_call("aria2.removeDownloadResult", [item.gid])
                 except Exception:
                     pass
-            self._delete_item_db(item_id)
+        with self._db_lock, self._db_conn as conn:
+            conn.executemany("DELETE FROM downloads WHERE id=?", [(iid,) for iid in completed_ids])
+        self._bump_version()
         return len(completed_ids)
 
     def assign_container(self, item_ids: List[int], container_name: str) -> None:
         """Assign one or more download items to a named container (package)."""
         clean_name = container_name.strip() or "General"
+        now = time.time()
+        rows = []
         for item_id in item_ids:
             item = self.items.get(item_id)
             if item:
                 item.extra["container"] = clean_name
-                self._update_item_db(item)
+                rows.append((json.dumps(item.extra), now, item.id))
+        if rows:
+            with self._db_lock, self._db_conn as conn:
+                conn.executemany("UPDATE downloads SET extra_json=?, updated_at=? WHERE id=?", rows)
+            self._bump_version()
 
     def get_containers(self) -> List[str]:
         """Return sorted list of unique container names currently in use."""
@@ -1141,7 +1264,9 @@ class DownloadEngine:
                 and it.status in ("error", "paused", "queued")
             ]
             if waiting_mf and self._session:
-                resolved_map = self.cloud_extractor.find_browser_resolved_mediafire_links()
+                resolved_map = await asyncio.to_thread(
+                    self.cloud_extractor.find_browser_resolved_mediafire_links
+                )
                 for it in waiting_mf:
                     qk = self.cloud_extractor.extract_mediafire_quickkey(it.url)
                     if qk and qk in resolved_map:
@@ -1154,6 +1279,7 @@ class DownloadEngine:
                             it.error_msg = ""
                             it.status = "queued"
                             self._update_item_db(it)
+                            self._bump_version()
                             asyncio.create_task(self.start_task(it.id))
 
         keys = [
@@ -1166,109 +1292,132 @@ class DownloadEngine:
             "errorMessage",
             "followedBy",
             "bittorrent",
-            "files",
         ]
-        for item in list(self.items.values()):
-            if not item.gid or item.extractor_type == "video":
-                continue
-            if item.status in ("complete", "stopped") and item.id not in self._decrypt_tasks:
-                continue
+        poll_items = [
+            item
+            for item in list(self.items.values())
+            if item.gid
+            and item.extractor_type != "video"
+            and item.status in ("active", "queued", "resolving")
+            and item.id not in self._decrypt_tasks
+        ]
 
-            try:
-                info = await self.rpc_call("aria2.tellStatus", [item.gid, keys])
-            except Exception:
-                continue
-
-            if not info:
-                continue
-
-            # If a Magnet metadata download spawned a follow-up BitTorrent GID, switch to it!
-            followed_by = info.get("followedBy")
-            if followed_by and isinstance(followed_by, list) and followed_by[0]:
-                new_gid = str(followed_by[0])
-                self._gid_to_id.pop(item.gid, None)
-                item.gid = new_gid
-                self._gid_to_id[new_gid] = item.id
-                self._update_item_db(item)
-                try:
-                    info = await self.rpc_call("aria2.tellStatus", [item.gid, keys])
-                except Exception:
+        if poll_items:
+            infos = await self.rpc_multicall_status([it.gid for it in poll_items], keys)
+            mutated = False
+            for item, info in zip(poll_items, infos):
+                if not info:
                     continue
 
-            bt_info = info.get("bittorrent") or {}
-            bt_name = (bt_info.get("info") or {}).get("name")
-            if bt_name and (item.filename.startswith("magnet_") or item.filename.endswith(".torrent")):
-                item.filename = bt_name
-
-            a_status = info.get("status", "")
-            tot = int(info.get("totalLength") or 0)
-            comp = int(info.get("completedLength") or 0)
-            spd = float(info.get("downloadSpeed") or 0.0)
-
-            if tot > 0:
-                if item.total_size > 10 * 1024 * 1024 and tot < 512 * 1024:
-                    # Server redirected an expired token to a tiny HTML error/repair page!
-                    pass
-                else:
-                    item.total_size = tot
-            item.completed_size = comp
-            item.speed = spd
-            if spd > 0 and item.total_size > item.completed_size:
-                item.eta = int((item.total_size - item.completed_size) / spd)
-            else:
-                item.eta = 0
-
-            if a_status == "active":
-                item.status = "active"
-            elif a_status == "waiting":
-                item.status = "queued"
-            elif a_status == "paused":
-                item.status = "paused"
-                item.speed = 0.0
-            elif a_status == "complete":
-                item.speed = 0.0
-                item.eta = 0
-                target_file = os.path.join(item.save_dir, item.filename)
-                if item.host == "MediaFire" and os.path.exists(target_file) and os.path.getsize(target_file) < 256 * 1024:
+                # If a Magnet metadata download spawned a follow-up BitTorrent GID, switch to it!
+                followed_by = info.get("followedBy")
+                if followed_by and isinstance(followed_by, list) and followed_by[0]:
+                    item.gid = str(followed_by[0])
+                    self._update_item_db(item)
+                    mutated = True
                     try:
-                        with open(target_file, "rb") as tf:
-                            head_bytes = tf.read(512).lstrip()
-                        if head_bytes.startswith((b"<!DOCTYPE", b"<html", b"<HTML")):
-                            os.remove(target_file)
-                            item.direct_url = ""
-                            item.gid = ""
-                            item.completed_size = 0
-                            item.status = "error"
-                            item.error_msg = (
-                                "El enlace temporal expiró (página HTML recibida). "
-                                "Haz clic en «Verificar en navegador» para renovarlo."
-                            )
-                            self._update_item_db(item)
-                            continue
+                        info = await self.rpc_call("aria2.tellStatus", [item.gid, keys])
                     except Exception:
-                        pass
-                if item.extractor_type == "mega" and item.id not in self._decrypt_tasks and item.status != "complete":
-                    self._decrypt_tasks.add(item.id)
-                    asyncio.create_task(self._finalize_mega_decryption(item))
-                elif item.extractor_type != "mega":
-                    if item.status != "complete":
+                        continue
+                    if not info:
+                        continue
+
+                bt_info = info.get("bittorrent") or {}
+                bt_name = (bt_info.get("info") or {}).get("name")
+                if bt_name and (item.filename.startswith("magnet_") or item.filename.endswith(".torrent")):
+                    if item.filename != bt_name:
+                        item.filename = bt_name
+                        mutated = True
+
+                a_status = info.get("status", "")
+                tot = int(info.get("totalLength") or 0)
+                comp = int(info.get("completedLength") or 0)
+                spd = float(info.get("downloadSpeed") or 0.0)
+
+                if tot > 0 and not (item.total_size > 10 * 1024 * 1024 and tot < 512 * 1024):
+                    if item.total_size != tot:
+                        item.total_size = tot
+                        mutated = True
+                if item.completed_size != comp:
+                    item.completed_size = comp
+                    mutated = True
+                if item.speed != spd:
+                    item.speed = spd
+                    mutated = True
+                new_eta = int((item.total_size - item.completed_size) / spd) if (spd > 0 and item.total_size > item.completed_size) else 0
+                if item.eta != new_eta:
+                    item.eta = new_eta
+                    mutated = True
+
+                if a_status == "active":
+                    if item.status != "active":
+                        item.status = "active"
+                        mutated = True
+                elif a_status == "waiting":
+                    if item.status != "queued":
+                        item.status = "queued"
+                        mutated = True
+                elif a_status == "paused":
+                    item.speed = 0.0
+                    if item.status != "paused":
+                        item.status = "paused"
+                        mutated = True
+                elif a_status == "complete":
+                    item.speed = 0.0
+                    item.eta = 0
+                    target_file = os.path.join(item.save_dir, item.filename)
+                    if item.host == "MediaFire":
+                        try:
+                            if os.path.getsize(target_file) < 256 * 1024:
+                                with open(target_file, "rb") as tf:
+                                    head_bytes = tf.read(512).lstrip()
+                                if head_bytes.startswith((b"<!DOCTYPE", b"<html", b"<HTML")):
+                                    os.remove(target_file)
+                                    item.direct_url = ""
+                                    item.gid = ""
+                                    item.completed_size = 0
+                                    item.status = "error"
+                                    item.error_msg = (
+                                        "El enlace temporal expiró (página HTML recibida). "
+                                        "Haz clic en «Verificar en navegador» para renovarlo."
+                                    )
+                                    self._update_item_db(item)
+                                    mutated = True
+                                    continue
+                        except OSError:
+                            pass
+                    if item.extractor_type == "mega" and item.id not in self._decrypt_tasks and item.status != "complete":
+                        self._decrypt_tasks.add(item.id)
+                        asyncio.create_task(self._finalize_mega_decryption(item))
+                        mutated = True
+                    elif item.extractor_type != "mega" and item.status != "complete":
                         item.status = "complete"
                         self._update_item_db(item)
-            elif a_status == "error":
-                item.status = "error"
-                item.speed = 0.0
-                item.eta = 0
-                item.error_msg = info.get("errorMessage") or f"Código aria2: {info.get('errorCode')}"
-                self._update_item_db(item)
+                        mutated = True
+                elif a_status == "error":
+                    item.status = "error"
+                    item.speed = 0.0
+                    item.eta = 0
+                    item.error_msg = info.get("errorMessage") or f"Código aria2: {info.get('errorCode')}"
+                    self._update_item_db(item)
+                    mutated = True
 
-        total_speed = sum(i.speed for i in self.items.values() if i.status in ("active", "merging"))
-        active_count = sum(
-            1 for i in self.items.values() if i.status in ("active", "resolving", "merging", "decrypting")
-        )
+            if mutated:
+                self._bump_version()
+
+        total_speed = 0.0
+        active_count = 0
+        for it in self.items.values():
+            st = it.status
+            if st in ("active", "merging"):
+                total_speed += it.speed
+            if st in ("active", "resolving", "merging", "decrypting"):
+                active_count += 1
         return total_speed, active_count
 
     async def _finalize_mega_decryption(self, item: DownloadItem) -> None:
         item.status = "decrypting"
+        self._bump_version()
         enc_name = item.extra.get("encrypted_filename", f".{item.filename}.mega_enc")
         enc_path = os.path.join(item.save_dir, enc_name)
         out_path = os.path.join(item.save_dir, item.filename)
@@ -1295,3 +1444,4 @@ class DownloadEngine:
             self._update_item_db(item)
         finally:
             self._decrypt_tasks.discard(item.id)
+            self._bump_version()

@@ -31,11 +31,12 @@ def _bootstrap_local_environment() -> None:
     if str(base_dir) not in sys.path:
         sys.path.insert(0, str(base_dir))
 
-    for sp in glob.glob(str(base_dir / ".venv" / "lib" / "python*" / "site-packages")):
-        site.addsitedir(sp)
-        if sp in sys.path:
-            sys.path.remove(sp)
-        sys.path.insert(1, sp)
+    if sys.prefix == sys.base_prefix:
+        for sp in glob.glob(str(base_dir / ".venv" / "lib" / "python*" / "site-packages")):
+            site.addsitedir(sp)
+            if sp in sys.path:
+                sys.path.remove(sp)
+            sys.path.insert(1, sp)
 
     local_typelib = base_dir / ".local_deps" / "usr" / "lib" / "x86_64-linux-gnu" / "girepository-1.0"
     if local_typelib.is_dir():

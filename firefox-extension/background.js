@@ -165,14 +165,22 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     st.pageUrl = tab.url;
   }
   if (tab && tab.url && isStreamingWatchPage(tab.url)) {
-    registerMediaForTab(tabId, {
-      url: tab.url,
-      title: tab.title || "Video de Streaming",
-      type: "Streaming",
-      isStreamPage: true,
-    });
+    const alreadyRegistered =
+      st.latestStream &&
+      st.latestStream.url === tab.url &&
+      st.pageTitle === (tab.title || st.pageTitle);
+    if (!alreadyRegistered || changeInfo.url) {
+      registerMediaForTab(tabId, {
+        url: tab.url,
+        title: tab.title || "Video de Streaming",
+        type: "Streaming",
+        isStreamPage: true,
+      });
+    }
   }
 });
+
+const IGNORED_REQ_TYPES = new Set(["stylesheet", "font", "script", "csp_report", "image"]);
 
 function isStreamingWatchPage(url) {
   if (!url) return false;
@@ -191,7 +199,7 @@ function isStreamingWatchPage(url) {
 // Capture outgoing request headers (Referer, Origin, User-Agent, Cookie) so yt-dlp/aria2c can authenticate HLS/MP4
 browser.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (details.tabId < 0 || IGNORED_REQ_TYPES.has(details.type)) return;
     const hdrs = {};
     for (const h of details.requestHeaders || []) {
       const n = h.name.toLowerCase();
@@ -223,7 +231,7 @@ const MEDIA_MIME_PREFIXES = [
 
 browser.webRequest.onHeadersReceived.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (details.tabId < 0 || IGNORED_REQ_TYPES.has(details.type)) return;
     const url = details.url;
     const uLow = url.toLowerCase();
     if (
