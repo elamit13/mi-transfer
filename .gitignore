@@ -1,0 +1,18 @@
+# Entornos locales y dependencias descargadas
+.venv/
+.local_deps/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Paquetes compilados / artefactos de build
+target/
+*.deb
+*.xpi
+
+# Bases de datos y archivos temporales
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mint Downloader IDM</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 390px;
+      min-height: 260px;
+      background: #0f172a;
+      color: #f8fafc;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      padding: 12px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.12);
+      margin-bottom: 10px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 800;
+      font-size: 14px;
+      color: #34d399;
+    }
+    .status-dot {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      background: rgba(16, 185, 129, 0.2);
+      color: #6ee7b7;
+    }
+    .toggle-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(255,255,255,0.05);
+      padding: 8px 10px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+      font-size: 12px;
+    }
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #94a3b8;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+    .media-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 310px;
+      overflow-y: auto;
+    }
+    .media-card {
+      background: rgba(30, 41, 59, 0.85);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .media-title {
+      font-weight: 600;
+      font-size: 12px;
+      color: #e2e8f0;
+      word-break: break-all;
+    }
+    .media-controls {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    select {
+      flex: 1;
+      background: #1e293b;
+      color: #f8fafc;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      padding: 4px 6px;
+      font-size: 11px;
+    }
+    button.dl-btn {
+      background: #10b981;
+      color: #052e16;
+      border: none;
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-weight: 700;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    button.dl-btn:hover {
+      background: #34d399;
+    }
+    .empty-msg {
+      text-align: center;
+      color: #64748b;
+      padding: 28px 10px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="brand">⚡ Mint Downloader IDM</div>
+    <span id="bridgeStatus" class="status-dot">Conectando...</span>
+  </div>
+
+  <div class="toggle-row">
+    <span>Capturar descargas del navegador automáticamente</span>
+    <input type="checkbox" id="chkIntercept" checked />
+  </div>
+
+  <div class="section-title">Videos y Streams detectados en esta pestaña</div>
+  <div id="mediaList" class="media-list">
+    <div class="empty-msg">Reproduce cualquier video en la página para descargarlo en múltiples resoluciones.</div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

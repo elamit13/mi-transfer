@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="50%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#2ecc71"/>
+    </linearGradient>
+    <linearGradient id="arrowGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#d1fae5"/>
+    </linearGradient>
+    <linearGradient id="boltGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fde047"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="dropShadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded Squircle Base -->
+  <rect x="16" y="16" width="224" height="224" rx="52" ry="52" fill="url(#bgGrad)" filter="url(#dropShadow)"/>
+  <rect x="20" y="20" width="216" height="216" rx="48" ry="48" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="3"/>
+
+  <!-- Speed / Multi-thread Parallel Tracks in Background -->
+  <g stroke="#ffffff" stroke-opacity="0.22" stroke-width="6" stroke-linecap="round">
+    <line x1="60" y1="54" x2="60" y2="110"/>
+    <line x1="196" y1="54" x2="196" y2="110"/>
+    <line x1="88" y1="42" x2="88" y2="78"/>
+    <line x1="168" y1="42" x2="168" y2="78"/>
+  </g>
+
+  <!-- Main Download Arrow -->
+  <path d="M106 48 H150 V116 H184 L128 174 L72 116 H106 Z" fill="url(#arrowGrad)" filter="url(#dropShadow)"/>
+
+  <!-- High-Speed Tray / Progress Bar at Bottom -->
+  <rect x="56" y="190" width="144" height="20" rx="10" ry="10" fill="#0f172a" fill-opacity="0.55"/>
+  <rect x="60" y="194" width="112" height="12" rx="6" ry="6" fill="#4ade80"/>
+  <circle cx="186" cy="200" r="5" fill="#fde047"/>
+
+  <!-- Turbo Lightning Bolt Badge -->
+  <path d="M186 44 L162 86 H182 L172 120 L208 74 H186 Z" fill="url(#boltGrad)" stroke="#0f172a" stroke-width="2" stroke-linejoin="round"/>
+</svg>
