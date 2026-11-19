@@ -26,6 +26,8 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from core.engine import DownloadEngine, DownloadItem
 from core.extractors.video_extractor import VideoQualityChoice, is_video_or_stream_url
+from core.upload_engine import UploadEngine
+from ui.uploader_view import UploaderPanel
 
 
 URL_EXTRACT_RE = re.compile(r"(?:https?|ftp|magnet)://[^\s<>\"']+|magnet:\?[^\s<>\"']+", re.I)
@@ -337,10 +339,11 @@ def format_eta(seconds: int) -> str:
 
 
 class AsyncEngineRunner:
-    """Runs DownloadEngine inside a dedicated background asyncio thread."""
+    """Runs DownloadEngine and UploadEngine inside a single dedicated background asyncio thread."""
 
-    def __init__(self, engine: DownloadEngine) -> None:
+    def __init__(self, engine: DownloadEngine, upload_engine: Optional[UploadEngine] = None) -> None:
         self.engine = engine
+        self.upload_engine = upload_engine or UploadEngine(db_path=engine.db_path)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, name="MintDL-AsyncLoop", daemon=True)
         self.total_speed_bps: float = 0.0
@@ -356,6 +359,7 @@ class AsyncEngineRunner:
 
     async def _init_and_poll(self) -> None:
         await self.engine.start()
+        await self.upload_engine.start()
         while self.engine._running:
             try:
                 spd, act = await self.engine.refresh_statuses()
@@ -369,9 +373,13 @@ class AsyncEngineRunner:
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     def stop(self) -> None:
+        async def _shutdown_all() -> None:
+            await self.upload_engine.shutdown()
+            await self.engine.shutdown()
+
         try:
-            fut = asyncio.run_coroutine_threadsafe(self.engine.shutdown(), self.loop)
-            fut.result(timeout=3.0)
+            fut = asyncio.run_coroutine_threadsafe(_shutdown_all(), self.loop)
+            fut.result(timeout=4.0)
         except Exception:
             pass
         self.loop.call_soon_threadsafe(self.loop.stop)
@@ -462,9 +470,13 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
     """Main GTK4 Window for Mint Downloader."""
 
     def __init__(self, app: Gtk.Application, runner: AsyncEngineRunner) -> None:
-        super().__init__(application=app, title="Mint Downloader")
+        GLib.set_application_name("Mi Transfer")
+        super().__init__(application=app, title="Mi Transfer — Descargas")
         self.runner = runner
         self.engine = runner.engine
+        self.upload_engine = runner.upload_engine
+        self._current_mode: str = "downloader"
+        self._synced_accounts_count: int = 0
         self.set_default_size(1160, 680)
         self._setup_app_icon()
 
@@ -607,6 +619,39 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         .speed-badge {
             font-weight: 700;
             color: #34d399;
+        }
+        .warn-badge {
+            font-weight: 700;
+            color: #fbbf24;
+        }
+        .mode-flip-btn {
+            min-height: 30px;
+            padding: 4px 12px;
+            border-radius: 99px;
+            font-size: 0.84em;
+            font-weight: 700;
+            background-image: linear-gradient(135deg, rgba(16, 185, 129, 0.22), rgba(56, 189, 248, 0.22));
+            background-color: rgba(16, 185, 129, 0.18);
+            border: 1px solid rgba(52, 211, 153, 0.50);
+            color: #ecfdf5;
+            box-shadow: none;
+            transition: all 160ms ease;
+        }
+        .mode-flip-btn:hover {
+            background-image: linear-gradient(135deg, rgba(16, 185, 129, 0.36), rgba(56, 189, 248, 0.36));
+            border-color: #34d399;
+        }
+        .mode-flip-btn label,
+        .mode-flip-btn image {
+            color: #ecfdf5;
+        }
+        .pro-btn-accent {
+            background-image: linear-gradient(135deg, rgba(14, 165, 233, 0.24), rgba(16, 185, 129, 0.24));
+            border: 1px solid rgba(56, 189, 248, 0.48);
+        }
+        .pro-btn-accent:hover {
+            background-image: linear-gradient(135deg, rgba(14, 165, 233, 0.38), rgba(16, 185, 129, 0.38));
+            border-color: #38bdf8;
         }
         .progress-pct-label {
             font-size: 0.82em;
@@ -887,6 +932,21 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         .custom-bg-root .pro-btn-primary image {{
             color: #ffffff;
         }}
+        .custom-bg-root .mode-flip-btn {{
+            background-image: linear-gradient(135deg, #059669, #0284c7);
+            background-color: #059669;
+            border: 1px solid rgba(52, 211, 153, 0.70);
+            color: #ffffff;
+        }}
+        .custom-bg-root .mode-flip-btn label,
+        .custom-bg-root .mode-flip-btn image {{
+            color: #ffffff;
+        }}
+        .custom-bg-root .pro-btn-accent {{
+            background-image: linear-gradient(135deg, rgba(14, 165, 233, 0.28), rgba(16, 185, 129, 0.28));
+            border: 1px solid rgba(14, 165, 233, 0.55);
+            color: {fg};
+        }}
         .custom-bg-root dropdown button,
         .custom-bg-root menubutton button,
         .custom-bg-root spinbutton {{
@@ -1061,7 +1121,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         self._root_box = root_box
         self.set_child(root_box)
 
-        # 1. Top Header Strip (Brand + Extension status on left, Search bar on right)
+        # 1. Top Header Strip (Brand + Flip Mode Button + Status pill on left, Search bar on right)
         header_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_strip.add_css_class("header-strip")
 
@@ -1069,16 +1129,29 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         if logo_path.is_file():
             logo_img = Gtk.Image.new_from_file(str(logo_path))
             logo_img.set_pixel_size(24)
-            logo_img.set_tooltip_text("Gestor de Descargas Mint")
+            logo_img.set_tooltip_text("Mi Transfer — Gestor de Descargas, Subidas y Nube")
             header_strip.append(logo_img)
 
-        brand_lbl = Gtk.Label(label="MINT DL")
-        brand_lbl.add_css_class("app-title-badge")
-        header_strip.append(brand_lbl)
+        self.brand_lbl = Gtk.Label(label="MI TRANSFER")
+        self.brand_lbl.add_css_class("app-title-badge")
+        header_strip.append(self.brand_lbl)
 
-        bridge_lbl = Gtk.Label(label="● Extensión Firefox IDM activa (127.0.0.1:16890)")
-        bridge_lbl.add_css_class("bridge-badge")
-        header_strip.append(bridge_lbl)
+        self.btn_mode_flip = Gtk.Button()
+        self.btn_mode_flip.add_css_class("mode-flip-btn")
+        self.btn_mode_flip.set_tooltip_text("Dar la vuelta y cambiar entre Descargas y Subidas")
+        flip_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._flip_icon = Gtk.Image.new_from_icon_name("object-flip-horizontal-symbolic")
+        self._flip_icon.set_pixel_size(15)
+        self._flip_lbl = Gtk.Label(label="Subidas")
+        flip_box.append(self._flip_icon)
+        flip_box.append(self._flip_lbl)
+        self.btn_mode_flip.set_child(flip_box)
+        self.btn_mode_flip.connect("clicked", self._on_flip_mode_clicked)
+        header_strip.append(self.btn_mode_flip)
+
+        self.bridge_lbl = Gtk.Label(label="● Extensión Firefox IDM activa (127.0.0.1:16890)")
+        self.bridge_lbl.add_css_class("bridge-badge")
+        header_strip.append(self.bridge_lbl)
 
         hdr_spacer = Gtk.Box()
         hdr_spacer.set_hexpand(True)
@@ -1087,11 +1160,23 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.add_css_class("search-entry")
         self.search_entry.set_placeholder_text("Buscar en la lista...")
-        self.search_entry.set_tooltip_text("Buscar por nombre, extensión, origen o estado")
+        self.search_entry.set_tooltip_text("Buscar por nombre, extensión, origen/destino o estado")
         self.search_entry.connect("search-changed", self._on_search_changed)
         header_strip.append(self.search_entry)
 
         root_box.append(header_strip)
+
+        # Flip Stack switching cleanly between Mint Downloader and Mint Uploader
+        self.mode_stack = Gtk.Stack()
+        self.mode_stack.set_transition_type(Gtk.StackTransitionType.ROTATE_LEFT_RIGHT)
+        self.mode_stack.set_transition_duration(360)
+        self.mode_stack.set_vexpand(True)
+        self.mode_stack.set_hexpand(True)
+        root_box.append(self.mode_stack)
+
+        downloader_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        downloader_page.set_vexpand(True)
+        downloader_page.set_hexpand(True)
 
         # 2. Main Split Body: Left Category Sidebar + Right Workspace
         body_split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -1330,9 +1415,9 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         right_panel.append(table_card)
 
         body_split.append(right_panel)
-        root_box.append(body_split)
+        downloader_page.append(body_split)
 
-        # 4. Bottom Status Bar
+        # 4. Bottom Status Bar (Downloader)
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         status_bar.add_css_class("status-bar")
 
@@ -1368,12 +1453,62 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         status_bar.append(self.lbl_total_speed)
         status_bar.append(self.btn_speed_limit)
 
-        root_box.append(status_bar)
+        downloader_page.append(status_bar)
+
+        # Mount Descargas & Subidas (con explorador de nube integrado) inside the flip Gtk.Stack
+        self.mode_stack.add_named(downloader_page, "downloader")
+        self.uploader_panel = UploaderPanel(
+            parent_window=self,
+            upload_engine=self.upload_engine,
+            download_engine=self.engine,
+            submit_coro=self.runner.submit,
+            open_theme_cb=self._on_theme_clicked,
+            open_path_cb=open_path_with_system,
+            on_switch_to_downloader_cb=lambda: self._switch_mode("downloader"),
+            on_accounts_changed_cb=self._on_uploader_accounts_changed,
+        )
+        self.mode_stack.add_named(self.uploader_panel.root, "uploader")
+        self.mode_stack.set_visible_child_name("downloader")
+
+    def _on_uploader_accounts_changed(self, count: int) -> None:
+        self._synced_accounts_count = count
+        if self._current_mode == "uploader":
+            self._update_header_mode_labels()
+
+    def _update_header_mode_labels(self) -> None:
+        self.brand_lbl.set_text("MI TRANSFER")
+        if self._current_mode == "uploader":
+            self.set_title("Mi Transfer — Subidas")
+            self._flip_lbl.set_text("Descargas")
+            if self._synced_accounts_count > 0:
+                word = "cuenta sincronizada" if self._synced_accounts_count == 1 else "cuentas sincronizadas"
+                self.bridge_lbl.set_text(f"● {self._synced_accounts_count} {word} (sesión permanente)")
+            else:
+                self.bridge_lbl.set_text("○ Sin cuentas sincronizadas — haz clic en «Agregar cuenta»")
+        else:
+            self.set_title("Mi Transfer — Descargas")
+            self._flip_lbl.set_text("Subidas")
+            self.bridge_lbl.set_text("● Extensión Firefox IDM activa (127.0.0.1:16890)")
+
+    def _switch_mode(self, mode: str) -> None:
+        if mode not in ("downloader", "uploader"):
+            return
+        self._current_mode = mode
+        self.mode_stack.set_visible_child_name(mode)
+        self._update_header_mode_labels()
+        self._on_search_changed(self.search_entry)
+
+    def _on_flip_mode_clicked(self, _btn: Gtk.Button) -> None:
+        self._switch_mode("uploader" if self._current_mode == "downloader" else "downloader")
 
     def _on_search_changed(self, entry: Gtk.SearchEntry) -> None:
-        self._search_query = entry.get_text().strip().lower()
-        self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
-        self._update_selection_footer()
+        q = entry.get_text().strip().lower()
+        if self._current_mode == "uploader":
+            self.uploader_panel.set_search_query(q)
+        else:
+            self._search_query = q
+            self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+            self._update_selection_footer()
 
     def _on_select_all_toggled(self, chk: Gtk.CheckButton) -> None:
         if self._syncing_select_all:
@@ -1784,6 +1919,8 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
                 self.lbl_total_speed.set_text(f"Velocidad Total: {format_speed_mbs(stats_key[0])}")
             if stats_key[1] != prev_act or stats_key[2] != prev_max:
                 self.lbl_active.set_text(f"Descargas activas: {stats_key[1]} / {stats_key[2]}")
+
+        self.uploader_panel.on_ui_tick()
 
         # JDownloader-style Clipboard Watcher: every ~1.5s, if the user copied a direct
         # download*.mediafire.com URL while there are waiting MediaFire tasks, auto-bind it!
@@ -2276,7 +2413,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
 
     def _on_theme_clicked(self, _btn: Gtk.Button) -> None:
         dialog, vbox = self._create_modal_window(
-            "Personalizar fondo de Mint Downloader",
+            "Personalizar fondo de Mi Transfer",
             500,
             340,
             spacing=12,
@@ -2290,7 +2427,7 @@ class MintDownloaderWindow(Gtk.ApplicationWindow):
         vbox.append(lbl_intro)
 
         # Mode selector buttons
-        chk_default = Gtk.CheckButton(label="Tema oscuro predeterminado de Mint Downloader")
+        chk_default = Gtk.CheckButton(label="Tema oscuro predeterminado de Mi Transfer")
         chk_color = Gtk.CheckButton(label="Color sólido personalizado", group=chk_default)
         chk_image = Gtk.CheckButton(label="Imagen de fondo personalizada", group=chk_default)
 

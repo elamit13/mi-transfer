@@ -622,6 +622,7 @@ class CloudExtractor:
         self,
         url: str,
         session: Optional[aiohttp.ClientSession] = None,
+        custom_headers: Optional[Dict[str, str]] = None,
     ) -> ResolvedDownload:
         host = detect_host(url)
         if host == "MEGA":
@@ -629,7 +630,7 @@ class CloudExtractor:
         if host == "MediaFire":
             return await self._resolve_mediafire(url, session=session)
         if host == "Google Drive":
-            return await self._resolve_gdrive(url)
+            return await self._resolve_gdrive(url, custom_headers=custom_headers)
         if host == "OneDrive":
             return await self._resolve_onedrive(url, session=session)
         if host == "1fichier":
@@ -841,7 +842,7 @@ class CloudExtractor:
                 label = f" ({api_filename})" if api_filename else ""
                 raise AntiBotChallengeError(
                     f"Requiere verificación en navegador{label}. "
-                    f"Haz doble clic en la fila para abrir en tu navegador; Mint Downloader capturará la descarga automáticamente."
+                    f"Haz doble clic en la fila para abrir en tu navegador; Mi Transfer capturará la descarga automáticamente."
                 )
 
             if any(
@@ -900,7 +901,11 @@ class CloudExtractor:
                 extra={"quickkey": quickkey},
             )
 
-    async def _resolve_gdrive(self, url: str) -> ResolvedDownload:
+    async def _resolve_gdrive(
+        self,
+        url: str,
+        custom_headers: Optional[Dict[str, str]] = None,
+    ) -> ResolvedDownload:
         file_id = None
         for pat in _GDRIVE_ID_PATTERNS:
             m = pat.search(url)
@@ -913,76 +918,135 @@ class CloudExtractor:
                 raise ProtectedFileError("Los enlaces de carpetas de Google Drive requieren enlaces de archivo individual.")
             raise ExtractorError("No se pudo identificar el ID de archivo de Google Drive.")
 
-        headers = {"User-Agent": DEFAULT_UA}
-        jar = aiohttp.CookieJar()
+        custom_cookie = ""
+        if custom_headers:
+            for k, v in custom_headers.items():
+                if k.lower() == "cookie" and v:
+                    custom_cookie = v
+                    break
+
         dl_endpoint = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
 
-        async with aiohttp.ClientSession(timeout=self.timeout, headers=headers, cookie_jar=jar) as session:
-            async with session.get(dl_endpoint, allow_redirects=True) as resp:
-                if resp.status == 404:
-                    raise DeadLinkError("El archivo de Google Drive no existe (HTTP 404).")
-                if resp.status in (401, 403):
-                    raise ProtectedFileError("El archivo de Google Drive es privado o requiere permisos.")
+        async def _attempt(use_cookie: bool) -> Optional[ResolvedDownload]:
+            headers = {"User-Agent": DEFAULT_UA}
+            if use_cookie and custom_cookie:
+                headers["Cookie"] = custom_cookie
+            jar = aiohttp.CookieJar()
+            async with aiohttp.ClientSession(timeout=self.timeout, headers=headers, cookie_jar=jar) as session:
+                async with session.get(dl_endpoint, allow_redirects=True) as resp:
+                    if resp.status == 404:
+                        raise DeadLinkError("El archivo de Google Drive no existe (HTTP 404).")
+                    if resp.status in (401, 403):
+                        if not use_cookie and custom_cookie:
+                            return None
+                        raise ProtectedFileError("El archivo de Google Drive es privado o requiere permisos.")
 
-                ctype = resp.headers.get("Content-Type", "")
-                if not ctype.startswith("text/html"):
-                    fname = _extract_filename_from_cd(resp.headers.get("Content-Disposition", "")) or f"gdrive_{file_id}.bin"
-                    size = int(resp.headers.get("Content-Length", 0) or 0)
-                    cookies = "; ".join(f"{c.key}={c.value}" for c in jar)
-                    req_headers = dict(headers)
-                    if cookies:
-                        req_headers["Cookie"] = cookies
-                    return ResolvedDownload(
-                        original_url=url,
-                        direct_url=str(resp.url),
-                        filename=fname,
-                        host="Google Drive",
-                        size=size,
-                        headers=req_headers,
-                        extractor_type="gdrive",
+                    ctype = resp.headers.get("Content-Type", "").lower()
+                    if not ctype.startswith("text/html"):
+                        fname = _extract_filename_from_cd(resp.headers.get("Content-Disposition", "")) or f"gdrive_{file_id}.bin"
+                        size = int(resp.headers.get("Content-Length", 0) or 0)
+                        jar_cookies = "; ".join(f"{c.key}={c.value}" for c in jar)
+                        req_headers = {"User-Agent": DEFAULT_UA}
+                        if use_cookie and custom_cookie:
+                            req_headers["Cookie"] = f"{custom_cookie}; {jar_cookies}" if jar_cookies else custom_cookie
+                        elif jar_cookies:
+                            req_headers["Cookie"] = jar_cookies
+                        return ResolvedDownload(
+                            original_url=url,
+                            direct_url=str(resp.url),
+                            filename=fname,
+                            host="Google Drive",
+                            size=size,
+                            headers=req_headers,
+                            extractor_type="gdrive",
+                            extra={"replace_headers": True},
+                        )
+
+                    page = await resp.text(errors="replace")
+
+                if any(
+                    msg in page
+                    for msg in (
+                        "Too many users have viewed or downloaded this file",
+                        "Download quota exceeded",
+                        "Sorry, you can't view or download this file at this time",
                     )
+                ):
+                    raise BandwidthLimitError("Cuota de descarga excedida en Google Drive para este archivo.")
 
-                page = await resp.text(errors="replace")
+                if "accounts.google.com/ServiceLogin" in page or "You need access" in page or "Necesitas acceso" in page:
+                    if not use_cookie and custom_cookie:
+                        return None
+                    raise ProtectedFileError("El archivo de Google Drive es privado y requiere iniciar sesión.")
 
-            if any(
-                msg in page
-                for msg in (
-                    "Too many users have viewed or downloaded this file",
-                    "Download quota exceeded",
-                    "Sorry, you can't view or download this file at this time",
+                m_action = _GDRIVE_FORM_RE.search(page)
+                action_url = html.unescape(m_action.group(1)) if m_action else "https://drive.usercontent.google.com/download"
+                params: dict[str, str] = {"id": file_id, "export": "download", "confirm": "t"}
+                for m_inp in _GDRIVE_INPUT_RE.finditer(page):
+                    params[m_inp.group(1)] = html.unescape(m_inp.group(2))
+
+                confirmed_url = f"{action_url}?{urllib.parse.urlencode(params)}"
+                fname = f"gdrive_{file_id}.bin"
+                m_name = _GDRIVE_NAME_RE.search(page)
+                if m_name:
+                    fname = _sanitize_filename(html.unescape(m_name.group(1)))
+
+                jar_cookies = "; ".join(f"{c.key}={c.value}" for c in jar)
+                req_headers = {"User-Agent": DEFAULT_UA}
+                if use_cookie and custom_cookie:
+                    req_headers["Cookie"] = f"{custom_cookie}; {jar_cookies}" if jar_cookies else custom_cookie
+                elif jar_cookies:
+                    req_headers["Cookie"] = jar_cookies
+
+                # Verify confirmed URL returns real binary (not another HTML page) and grab exact size
+                size = 0
+                final_url = confirmed_url
+                try:
+                    async with session.get(
+                        confirmed_url,
+                        headers={"Range": "bytes=0-0"},
+                        allow_redirects=True,
+                    ) as probe:
+                        pct = probe.headers.get("Content-Type", "").lower()
+                        if probe.status in (200, 206) and not pct.startswith("text/html"):
+                            final_url = str(probe.url)
+                            cd_name = _extract_filename_from_cd(probe.headers.get("Content-Disposition", ""))
+                            if cd_name:
+                                fname = cd_name
+                            cr = probe.headers.get("Content-Range", "")
+                            if "/" in cr:
+                                try:
+                                    size = int(cr.split("/")[-1])
+                                except ValueError:
+                                    pass
+                            elif probe.headers.get("Content-Length"):
+                                try:
+                                    size = int(probe.headers.get("Content-Length", "0"))
+                                except ValueError:
+                                    pass
+                except Exception:
+                    pass
+
+                return ResolvedDownload(
+                    original_url=url,
+                    direct_url=final_url,
+                    filename=fname,
+                    host="Google Drive",
+                    size=size,
+                    headers=req_headers,
+                    extractor_type="gdrive",
+                    extra={"replace_headers": True},
                 )
-            ):
-                raise BandwidthLimitError("Cuota de descarga excedida en Google Drive para este archivo.")
 
-            if "accounts.google.com/ServiceLogin" in page or "You need access" in page:
-                raise ProtectedFileError("El archivo de Google Drive es privado y requiere iniciar sesión.")
-
-            m_action = _GDRIVE_FORM_RE.search(page)
-            action_url = html.unescape(m_action.group(1)) if m_action else "https://drive.usercontent.google.com/download"
-            params: dict[str, str] = {"id": file_id, "export": "download", "confirm": "t"}
-            for m_inp in _GDRIVE_INPUT_RE.finditer(page):
-                params[m_inp.group(1)] = html.unescape(m_inp.group(2))
-
-            confirmed_url = f"{action_url}?{urllib.parse.urlencode(params)}"
-            fname = f"gdrive_{file_id}.bin"
-            m_name = _GDRIVE_NAME_RE.search(page)
-            if m_name:
-                fname = _sanitize_filename(html.unescape(m_name.group(1)))
-
-            cookies = "; ".join(f"{c.key}={c.value}" for c in jar)
-            req_headers = dict(headers)
-            if cookies:
-                req_headers["Cookie"] = cookies
-
-            return ResolvedDownload(
-                original_url=url,
-                direct_url=confirmed_url,
-                filename=fname,
-                host="Google Drive",
-                size=0,
-                headers=req_headers,
-                extractor_type="gdrive",
-            )
+        # Try clean unauthenticated download first (public/shared links work cleanly without cookie confirm traps)
+        res = await _attempt(use_cookie=False)
+        if res is not None:
+            return res
+        # Retry with authenticated Google cookies for private files
+        res2 = await _attempt(use_cookie=True)
+        if res2 is not None:
+            return res2
+        raise ProtectedFileError("El archivo de Google Drive es privado o requiere re-abrir sesión.")
 
     async def _resolve_onedrive(
         self,

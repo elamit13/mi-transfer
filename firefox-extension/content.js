@@ -500,7 +500,7 @@
         if (resp && resp.ok) {
           statusBadge.textContent = `✓ En cola (${quality})`;
         } else {
-          statusBadge.textContent = "⚠️ Abre Mint Downloader";
+          statusBadge.textContent = "⚠️ Abre Mi Transfer";
         }
         setTimeout(() => {
           if (statusBadge) statusBadge.textContent = "";

@@ -101,9 +101,9 @@ cat > "${DESKTOP_FILE}" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Mint Downloader
-GenericName=Gestor de Descargas
-Comment=Gestor de descargas simultáneas ligero y ultrarrápido (aria2c + yt-dlp)
+Name=Mi Transfer
+GenericName=Gestor de Descargas, Subidas y Nube
+Comment=Gestor de descargas aceleradas, subidas multi-cuenta y explorador de nube (GDrive, MEGA, OneDrive, Dropbox, Mediafire)
 Exec="${APP_DIR}/.venv/bin/python" "${APP_DIR}/main.py" %U
 Path=${APP_DIR}
 Icon=${APP_DIR}/assets/mint-downloader.svg
@@ -126,6 +126,6 @@ echo "[*] Ejecutando verificación de módulos y motores..."
 
 echo "============================================================"
 echo " Instalación completada con éxito."
-echo " Puedes abrir 'Mint Downloader' desde el menú de Linux Mint"
+echo " Puedes abrir 'Mi Transfer' desde el menú de Linux Mint"
 echo " o ejecutando: /usr/bin/python3 ${APP_DIR}/main.py"
 echo "============================================================"

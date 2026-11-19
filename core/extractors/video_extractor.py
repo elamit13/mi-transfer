@@ -15,7 +15,16 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-import yt_dlp
+_yt_dlp_mod = None
+
+
+def _get_yt_dlp():
+    global _yt_dlp_mod
+    if _yt_dlp_mod is None:
+        import yt_dlp as _mod
+        _yt_dlp_mod = _mod
+    return _yt_dlp_mod
+
 
 from .cloud_extractor import (
     BandwidthLimitError,
@@ -154,7 +163,7 @@ class VideoExtractor:
             "extract_flat": False,
         }
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with _get_yt_dlp().YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as exc:
             raise self._classify_ytdlp_error(str(exc)) from exc
@@ -260,14 +269,14 @@ class VideoExtractor:
             ydl_opts["ffmpeg_location"] = self.ffmpeg_path
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with _get_yt_dlp().YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as exc:
             # Fallback to generic "best" if a specific resolution filter wasn't present on an HLS/embed stream
             if fmt != "best":
                 ydl_opts["format"] = "best"
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                    with _get_yt_dlp().YoutubeDL(ydl_opts) as ydl2:
                         info = ydl2.extract_info(url, download=False)
                 except Exception as exc2:
                     raise self._classify_ytdlp_error(str(exc2)) from exc2
@@ -428,7 +437,7 @@ class VideoExtractor:
             ydl_opts["ffmpeg_location"] = self.ffmpeg_path
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with _get_yt_dlp().YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         except DownloadCancelledError:
             raise
@@ -438,7 +447,7 @@ class VideoExtractor:
             if ydl_opts.get("format") != "best":
                 ydl_opts["format"] = "best"
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                    with _get_yt_dlp().YoutubeDL(ydl_opts) as ydl2:
                         ydl2.download([url])
                 except Exception as exc2:
                     raise self._classify_ytdlp_error(str(exc2)) from exc2

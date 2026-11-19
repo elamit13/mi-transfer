@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "name": "Mint Downloader IDM Integration",
+  "name": "Mi Transfer IDM Integration",
   "version": "1.0.0",
-  "description": "Integración estilo IDM para Mint Downloader: botón flotante sobre videos con selector de resoluciones, detector de streams en la pestaña e intercepción automática de descargas.",
+  "description": "Integración estilo IDM para Mi Transfer: botón flotante sobre videos con selector de resoluciones, detector de streams en la pestaña e intercepción automática de descargas.",
   "icons": {
     "48": "icon.svg",
     "96": "icon.svg"
@@ -20,7 +20,7 @@
   },
   "browser_action": {
     "default_icon": "icon.svg",
-    "default_title": "Mint Downloader - Videos y Descargas",
+    "default_title": "Mi Transfer - Videos y Descargas",
     "default_popup": "popup.html"
   },
   "content_scripts": [

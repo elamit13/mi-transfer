@@ -580,7 +580,7 @@ class DownloadEngine:
 
         async def _handle_ping(_req: web.Request) -> web.Response:
             return web.json_response(
-                {"status": "ok", "app": "Mint Downloader", "save_dir": self.save_dir},
+                {"status": "ok", "app": "Mi Transfer", "save_dir": self.save_dir},
                 headers=cors_headers,
             )
 
@@ -798,6 +798,8 @@ class DownloadEngine:
         custom_headers: Optional[Dict[str, str]] = None,
         filename_hint: str = "",
         source_page: str = "",
+        skip_extractor: bool = False,
+        expected_size: int = 0,
     ) -> List[DownloadItem]:
         target_dir = save_dir or self.save_dir
         clean_container = container.strip().strip("/\\") if container else ""
@@ -914,6 +916,8 @@ class DownloadEngine:
                     "container": clean_container or "General",
                     "filename_hint": filename_hint,
                     "source_page": source_page,
+                    "skip_extractor": bool(skip_extractor),
+                    "expected_size": int(expected_size or 0),
                 },
             )
             item.id = self._insert_item_db(item)
@@ -927,20 +931,92 @@ class DownloadEngine:
     async def _resolve_and_enqueue(self, item: DownloadItem, auto_start: bool = True) -> None:
         try:
             quality = item.extra.get("quality", "best")
-            if is_video_or_stream_url(item.url):
+            if item.extra.get("skip_extractor"):
+                # Direct pre-authenticated cloud API download (e.g. clients6.google.com/drive/v2internal/...?alt=media)
+                probed_ok = False
+                probed_size = int(item.extra.get("expected_size") or 0)
+                final_url = item.url
+                if self._session:
+                    try:
+                        probe_hdrs = {**item.headers, "Range": "bytes=0-0"}
+                        async with self._session.get(
+                            item.url,
+                            headers=probe_hdrs,
+                            allow_redirects=True,
+                            timeout=aiohttp.ClientTimeout(total=15),
+                        ) as presp:
+                            pct = presp.headers.get("Content-Type", "").lower()
+                            if presp.status in (200, 206) and not pct.startswith("text/html"):
+                                probed_ok = True
+                                final_url = str(presp.url)
+                                cr = presp.headers.get("Content-Range", "")
+                                if "/" in cr:
+                                    try:
+                                        probed_size = int(cr.split("/")[-1])
+                                    except ValueError:
+                                        pass
+                                elif presp.headers.get("Content-Length"):
+                                    try:
+                                        cl = int(presp.headers.get("Content-Length", "0"))
+                                        if cl > 1:
+                                            probed_size = cl
+                                    except ValueError:
+                                        pass
+                    except Exception:
+                        probed_ok = False
+
+                if probed_ok:
+                    hint = str(item.extra.get("filename_hint") or item.filename or "archivo.bin").strip()
+                    raw_fname = _sanitize_filename(hint)
+                    item.direct_url = item.url if "clients6.google.com" in item.url.lower() else final_url
+                    item.filename = self._ensure_unique_filename(item.save_dir, raw_fname, item.id, self.items)
+                    item.host = str(item.extra.get("source_page") or detect_host(item.url))
+                    item.total_size = probed_size
+                    item.extractor_type = "direct"
+                    item.error_msg = ""
+                    item.status = "queued"
+                    self._update_item_db(item)
+                    self._bump_version()
+                    if auto_start:
+                        await self.start_task(item.id)
+                    return
+
+                # Fallback for clients6.google.com if direct API probe failed -> standard GDrive resolver
+                m_gid = re.search(r"/files/([a-zA-Z0-9_-]{10,})", item.url)
+                if m_gid:
+                    fallback_url = f"https://drive.google.com/uc?export=download&id={m_gid.group(1)}"
+                    resolved = await self.cloud_extractor.resolve(
+                        fallback_url,
+                        session=self._session,
+                        custom_headers=item.headers if item.headers else None,
+                    )
+                else:
+                    resolved = await self.cloud_extractor.resolve(
+                        item.url,
+                        session=self._session,
+                        custom_headers=item.headers if item.headers else None,
+                    )
+            elif is_video_or_stream_url(item.url):
                 resolved = await self.video_extractor.probe(
                     item.url,
                     quality=quality,
                     custom_headers=item.headers if item.headers else None,
                 )
             else:
-                resolved = await self.cloud_extractor.resolve(item.url, session=self._session)
+                resolved = await self.cloud_extractor.resolve(
+                    item.url,
+                    session=self._session,
+                    custom_headers=item.headers if item.headers else None,
+                )
 
             item.direct_url = resolved.direct_url
             hint = str(item.extra.get("filename_hint") or "").strip()
             generic_hls_names = ("download.bin", "index", "master", "playlist", "stream", "video", "manifest")
             res_base_low = os.path.splitext(resolved.filename)[0].lower()
-            if hint and any(res_base_low.startswith(g) for g in generic_hls_names):
+            if hint and (
+                any(res_base_low.startswith(g) for g in generic_hls_names)
+                or resolved.filename.startswith("gdrive_")
+            ):
                 if not os.path.splitext(hint)[1]:
                     hint = f"{hint}.mp4"
                 raw_fname = _sanitize_filename(hint)
@@ -956,11 +1032,14 @@ class DownloadEngine:
                 item.save_dir, raw_fname, item.id, self.items
             )
             item.host = resolved.host
-            item.total_size = resolved.size
-            merged_headers = dict(resolved.headers)
-            if item.headers:
-                merged_headers.update(item.headers)
-            item.headers = merged_headers
+            item.total_size = resolved.size or int(item.extra.get("expected_size") or 0)
+            if resolved.extra.get("replace_headers"):
+                item.headers = dict(resolved.headers)
+            else:
+                merged_headers = dict(resolved.headers)
+                if item.headers:
+                    merged_headers.update(item.headers)
+                item.headers = merged_headers
             item.extractor_type = resolved.extractor_type
             item.extra.update(resolved.extra)
             item.error_msg = ""
@@ -1016,10 +1095,15 @@ class DownloadEngine:
             if item.extractor_type == "mega"
             else item.filename
         )
+        dl_low = (item.direct_url or "").lower()
+        is_google_dl = any(
+            h in dl_low for h in ("google.com/", "googleusercontent.com/", "clients6.google.com/", "googleapis.com/")
+        )
+        conn_count = "4" if is_google_dl else "16"
         options: Dict[str, Any] = {
             "dir": item.save_dir,
-            "max-connection-per-server": "16",
-            "split": "16",
+            "max-connection-per-server": conn_count,
+            "split": conn_count,
             "min-split-size": "1M",
             "continue": "true",
         }

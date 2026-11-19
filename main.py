@@ -62,31 +62,38 @@ def _bootstrap_local_environment() -> None:
 _bootstrap_local_environment()
 
 import asyncio
+from core.account_vault import UPLOAD_PROVIDERS
 from core.engine import DownloadEngine
+from core.upload_engine import UploadEngine
 from ui.main_window import AsyncEngineRunner, MintDownloaderApp
 
 
 async def _run_self_test() -> int:
-    """Run a quick diagnostic check of aria2c, yt-dlp, ffmpeg, GTK4, and SQLite."""
+    """Run a quick diagnostic check of aria2c, yt-dlp, ffmpeg, GTK4, SQLite, and Mint Uploader."""
     import shutil
     import gi
 
     gi.require_version("Gtk", "4.0")
     from gi.repository import Gtk
 
-    print("=== Diagnóstico de Mint Downloader ===")
+    print("=== Diagnóstico de Mi Transfer (Descargas · Subidas · Nube) ===")
     print(f"  [OK] Python: {sys.version.split()[0]}")
     print(
         f"  [OK] GTK4: {Gtk.get_major_version()}.{Gtk.get_minor_version()}.{Gtk.get_micro_version()}"
     )
 
     engine = DownloadEngine()
+    upload_engine = UploadEngine(db_path=engine.db_path)
     await engine.start()
+    await upload_engine.start()
     ver = await engine.rpc_call("aria2.getVersion")
+    prov_names = ", ".join(lbl for _, lbl, _ in UPLOAD_PROVIDERS)
     print(f"  [OK] aria2c RPC activo: v{ver.get('version')} (puerto {engine.rpc_port})")
     print(f"  [OK] yt-dlp: {shutil.which('yt-dlp') or 'instalado (módulo python)'}")
     print(f"  [OK] ffmpeg: {shutil.which('ffmpeg') or 'no encontrado'}")
-    print(f"  [OK] SQLite DB: {engine.db_path}")
+    print(f"  [OK] Mi Transfer Nube ({len(upload_engine.list_accounts())} cuentas): {prov_names}")
+    print(f"  [OK] SQLite DB (WAL): {engine.db_path}")
+    await upload_engine.shutdown()
     await engine.shutdown()
     print("=== Todos los subsistemas están operativos ===")
     return 0
@@ -97,7 +104,8 @@ def main() -> int:
         return asyncio.run(_run_self_test())
 
     engine = DownloadEngine()
-    runner = AsyncEngineRunner(engine)
+    upload_engine = UploadEngine(db_path=engine.db_path)
+    runner = AsyncEngineRunner(engine, upload_engine)
     runner.start()
 
     app = MintDownloaderApp(runner)
